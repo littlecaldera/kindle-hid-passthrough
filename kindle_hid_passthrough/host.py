@@ -16,7 +16,7 @@ from device_cache import DeviceCache
 from logging_utils import log
 from pairing import create_keystore, create_pairing_config
 from transport import create_bumble_device
-from uhid_handler import Bus, UHIDDevice, strip_digitizer_collections
+from uhid_handler import Bus, UHIDDevice, descriptor_is_pointer, strip_digitizer_collections
 
 __all__ = ['HIDHost']
 
@@ -68,6 +68,10 @@ class HIDHost(ClassicMixin, BLEMixin):
         self.device_cache = DeviceCache(config.cache_dir)
 
         self.uhid_device = None
+        self._is_pointer = False
+        # Set by the daemon: called with True when a mouse/pointer device
+        # gets its UHID device, False when it goes away (drives the cursor).
+        self.on_pointer_change = None
 
         self._disconnection_event = None
         self._connection_future = None
@@ -380,8 +384,20 @@ class HIDHost(ClassicMixin, BLEMixin):
             log.success(f"UHID device created: {name}")
             asyncio.get_event_loop().call_later(
                 0.5, self.uhid_device.discover_input_paths)
+            self._is_pointer = descriptor_is_pointer(descriptor)
+            log.info(f"Pointer device: {self._is_pointer} (cursor overlay {'on' if self._is_pointer else 'off'})")
+            self._notify_pointer(True)
         except Exception as e:
             log.error(f"Failed to create UHID device: {e}")
+
+    def _notify_pointer(self, active: bool):
+        """Tell the daemon a pointer device appeared/left, so it can toggle the cursor."""
+        if not self._is_pointer or not self.on_pointer_change:
+            return
+        try:
+            self.on_pointer_change(active)
+        except Exception as e:
+            log.warning(f"cursor hook failed: {e}")
 
     def _is_connection_alive(self) -> bool:
         """Check if the connection is still alive and usable."""
@@ -407,6 +423,8 @@ class HIDHost(ClassicMixin, BLEMixin):
             self._connection_tasks.clear()
 
         if self.uhid_device:
+            self._notify_pointer(False)
+            self._is_pointer = False
             try:
                 self.uhid_device.destroy()
             except Exception:

@@ -273,7 +273,7 @@ class DaemonController:
             return self._cursor_proc is not None and self._cursor_proc.poll() is None
 
     def request_cursor_start(self):
-        """From HTTP thread: launch the mousecursor overlay binary."""
+        """Launch the mousecursor overlay binary (driven by pointer connect)."""
         with self._cursor_lock:
             if self._cursor_proc is not None and self._cursor_proc.poll() is None:
                 return
@@ -285,7 +285,7 @@ class DaemonController:
             )
 
     def request_cursor_stop(self):
-        """From HTTP thread: kill the mousecursor overlay binary."""
+        """Kill the mousecursor overlay binary (driven by pointer disconnect)."""
         with self._cursor_lock:
             if self._cursor_proc is None or self._cursor_proc.poll() is not None:
                 self._cursor_proc = None
