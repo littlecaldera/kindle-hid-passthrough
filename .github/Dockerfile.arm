@@ -107,6 +107,18 @@ RUN cp /lib/ld-linux-armhf.so.3 /build/nuitka-out/main.dist/ld-linux-armhf.so.3 
     done && \
     echo "Bundled libs:" && ls -la /build/nuitka-out/main.dist/lib*.so*
 
+# Compile the mouse cursor overlay helper (C, X11) and bundle it + its X11 lib
+# chain into the same dist/. It runs as its own process against the bundled
+# glibc, so it is immune to the Kindle's 2.20 and to per-model interpreter paths.
+RUN apt-get update && apt-get install -y --no-install-recommends libx11-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY kindle_hid_passthrough/mousecursor.c /build/mousecursor.c
+RUN gcc -O2 /build/mousecursor.c -o /build/nuitka-out/main.dist/mousecursor.bin -lX11 && \
+    strip /build/nuitka-out/main.dist/mousecursor.bin && \
+    ldd /build/nuitka-out/main.dist/mousecursor.bin | awk '/=> \//{print $3}' | \
+        while read -r lib; do cp -Ln "$lib" /build/nuitka-out/main.dist/ 2>/dev/null || true; done && \
+    echo "Cursor deps:" && ls -la /build/nuitka-out/main.dist/mousecursor.bin /build/nuitka-out/main.dist/libX11* /build/nuitka-out/main.dist/libxcb*
+
 # Build C wrapper that invokes the bundled ld-linux directly
 # This bypasses the system dynamic linker entirely
 RUN printf '%s\n' \
