@@ -7,6 +7,23 @@
 # completely bypassing the Kindle's ancient glibc 2.20 / dynamic linker.
 # No staticx needed — just a directory with everything.
 
+# --- mouse cursor overlay -------------------------------------------------
+# Build the C overlay against an old glibc (Debian Buster, 2.28) so it only
+# references symbols present on the Kindle's glibc 2.20, then point its ELF
+# interpreter at /lib/ld-linux.so.3 (the path Kindles ship). One self-contained
+# binary that runs in both dev and release, using the Kindle's own libX11.
+FROM arm32v7/debian:buster-slim AS mousecursor
+RUN echo 'deb http://archive.debian.org/debian buster main' > /etc/apt/sources.list \
+    && echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev libx11-dev patchelf \
+    && rm -rf /var/lib/apt/lists/*
+COPY kindle_hid_passthrough/mousecursor.c /build/mousecursor.c
+RUN gcc -O2 /build/mousecursor.c -o /build/mousecursor -lX11 \
+    && patchelf --set-interpreter /lib/ld-linux.so.3 /build/mousecursor \
+    && strip /build/mousecursor
+# --------------------------------------------------------------------------
+
 FROM arm32v7/python:3.11-slim-bookworm
 
 # Install build dependencies
@@ -107,17 +124,8 @@ RUN cp /lib/ld-linux-armhf.so.3 /build/nuitka-out/main.dist/ld-linux-armhf.so.3 
     done && \
     echo "Bundled libs:" && ls -la /build/nuitka-out/main.dist/lib*.so*
 
-# Compile the mouse cursor overlay helper (C, X11) and bundle it + its X11 lib
-# chain into the same dist/. It runs as its own process against the bundled
-# glibc, so it is immune to the Kindle's 2.20 and to per-model interpreter paths.
-RUN apt-get update && apt-get install -y --no-install-recommends libx11-dev \
-    && rm -rf /var/lib/apt/lists/*
-COPY kindle_hid_passthrough/mousecursor.c /build/mousecursor.c
-RUN gcc -O2 /build/mousecursor.c -o /build/nuitka-out/main.dist/mousecursor.bin -lX11 && \
-    strip /build/nuitka-out/main.dist/mousecursor.bin && \
-    ldd /build/nuitka-out/main.dist/mousecursor.bin | awk '/=> \//{print $3}' | \
-        while read -r lib; do cp -Ln "$lib" /build/nuitka-out/main.dist/ 2>/dev/null || true; done && \
-    echo "Cursor deps:" && ls -la /build/nuitka-out/main.dist/mousecursor.bin /build/nuitka-out/main.dist/libX11* /build/nuitka-out/main.dist/libxcb*
+# Pull in the mouse cursor overlay binary from the old-glibc build stage.
+COPY --from=mousecursor /build/mousecursor /build/mousecursor
 
 # Build C wrapper that invokes the bundled ld-linux directly
 # This bypasses the system dynamic linker entirely

@@ -77,8 +77,12 @@ jobs:
           # Extract entire Nuitka standalone dist directory (includes ld-linux + all .so deps)
           docker cp "$CONTAINER_ID:/build/nuitka-out/main.dist/." ./output/dist/
 
+          # Extract the mouse cursor overlay binary (old-glibc build)
+          mkdir -p output/scripts
+          docker cp "$CONTAINER_ID:/build/mousecursor" ./output/scripts/mousecursor
+
           docker rm "$CONTAINER_ID"
-          chmod +x output/kindle-hid-passthrough output/dist/main.bin output/dist/ld-linux-armhf.so.3
+          chmod +x output/kindle-hid-passthrough output/dist/main.bin output/dist/ld-linux-armhf.so.3 output/scripts/mousecursor
 
       - name: Add scripts and assets
         run: |

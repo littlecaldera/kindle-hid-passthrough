@@ -1,7 +1,0 @@
-#!/bin/sh
-# Launcher for the bundled mouse cursor overlay (release layout).
-# Invokes the bundled dynamic linker directly so it runs against the bundled
-# glibc/libX11, independent of the Kindle's glibc 2.20 and interpreter path.
-BASE=$(cd "$(dirname "$0")/.." && pwd)
-DIST="$BASE/dist"
-exec "$DIST/ld-linux-armhf.so.3" --library-path "$DIST" "$DIST/mousecursor.bin" "$@"
