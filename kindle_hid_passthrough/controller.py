@@ -278,11 +278,15 @@ class DaemonController:
             if self._cursor_proc is not None and self._cursor_proc.poll() is None:
                 return
             binary = os.path.join(config.base_path, 'scripts', 'mousecursor')
-            self._cursor_proc = subprocess.Popen(
-                [binary],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            errlog = os.path.join(config.base_path, 'cache', 'mousecursor.log')
+            try:
+                err = open(errlog, 'ab')
+                self._cursor_proc = subprocess.Popen(
+                    [binary], stdout=subprocess.DEVNULL, stderr=err)
+                logger.info(f"Cursor overlay started (pid {self._cursor_proc.pid})")
+            except OSError as e:
+                logger.error(f"Cursor overlay failed to launch ({binary}): {e}")
+                self._cursor_proc = None
 
     def request_cursor_stop(self):
         """Kill the mousecursor overlay binary (driven by pointer disconnect)."""
