@@ -22,7 +22,6 @@
 #include <unistd.h>
 
 #define FB_DEV    "/dev/fb0"
-#define FBINK     "/var/local/kmc/armhf/bin/fbink"
 #define WAVEFORM  "A2"
 #define POLL_US   15000
 #define SCALE_NORMAL   3
@@ -30,6 +29,27 @@
 #define LOW_RES_WIDTH  1000
 
 static int swap_xy = 0, invert_x = 0, invert_y = 0;
+static const char *g_fbink = NULL;
+
+/* Locate fbink at runtime instead of a hardcoded path: honor $KHP_FBINK, else
+ * probe the bundled copy and the usual KOReader/KMC/libkh install spots. */
+static const char *resolve_fbink(void)
+{
+	const char *env = getenv("KHP_FBINK");
+	if (env && *env)
+		return env;
+	static const char *cands[] = {
+		"/mnt/us/kindle_hid_passthrough/dist/fbink",
+		"/mnt/us/koreader/fbink",
+		"/mnt/us/libkh/bin/fbink",
+		"/var/local/kmc/bin/fbink",
+		NULL,
+	};
+	for (int i = 0; cands[i]; i++)
+		if (access(cands[i], X_OK) == 0)
+			return cands[i];
+	return cands[0];
+}
 
 /* '#' is fill; the white border is derived from the empty cells next to it.
  * hot_col/hot_row is the cell that sits under the pointer. */
@@ -204,7 +224,7 @@ static void refresh(rect a)
 
 	pid_t pid = fork();
 	if (pid == 0) {
-		execl(FBINK, FBINK, "-q", "-s", reg, "-W", WAVEFORM, (char *)0);
+		execl(g_fbink, g_fbink, "-q", "-s", reg, "-W", WAVEFORM, (char *)0);
 		_exit(127);
 	}
 	if (pid > 0)
@@ -223,6 +243,8 @@ static rect merge(rect a, rect b)
 
 int main(void)
 {
+	g_fbink = resolve_fbink();
+
 	if (fb_init())
 		return 1;
 
