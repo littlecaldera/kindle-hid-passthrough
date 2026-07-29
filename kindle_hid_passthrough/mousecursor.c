@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,16 +23,23 @@
 #include <unistd.h>
 
 #define FB_DEV    "/dev/fb0"
-#define WAVEFORM  "A2"          /* fast, 2-level: used while the cursor moves */
+#define WAVEFORM  "DU"          /* fast 2-level, does not hold the panel in A2 mode */
 #define WAVEFORM_FULL "GC16"    /* full grayscale: clears A2 ghosting when idle */
-#define IDLE_REFRESH_US 800000  /* GC16 cleanup after the pointer sits still this long */
-#define POLL_US   15000
+#define IDLE_REFRESH_US 5000000 /* GC16 cleanup after the pointer sits still this long */
+#define POLL_US   15000         /* poll/refresh cadence */
 #define SCALE_NORMAL   3
 #define SCALE_LOW_RES  2
 #define LOW_RES_WIDTH  1000
 
 static int swap_xy = 0, invert_x = 0, invert_y = 0;
 static const char *g_fbink = NULL;
+static volatile sig_atomic_t g_quit = 0;
+
+static void on_quit(int sig)
+{
+	(void)sig;
+	g_quit = 1;
+}
 
 /* Locate fbink at runtime instead of a hardcoded path: honor $KHP_FBINK, else
  * probe the bundled copy and the usual KOReader/KMC/libkh install spots. */
@@ -251,6 +259,8 @@ static rect merge(rect a, rect b)
 int main(void)
 {
 	g_fbink = resolve_fbink();
+	signal(SIGTERM, on_quit);
+	signal(SIGINT, on_quit);
 
 	if (fb_init())
 		return 1;
@@ -318,5 +328,18 @@ int main(void)
 			dirty_have = 0;
 		}
 		usleep(POLL_US);
+
+		/* On stop (SIGTERM from the daemon), erase the cursor so it doesn't
+		 * stay frozen on the eink, then exit. */
+		if (g_quit) {
+			if (have) {
+				unstash();
+				refresh_wave(old, WAVEFORM_FULL);
+			}
+			break;
+		}
 	}
+
+	XCloseDisplay(dpy);
+	return 0;
 }
