@@ -22,7 +22,9 @@
 #include <unistd.h>
 
 #define FB_DEV    "/dev/fb0"
-#define WAVEFORM  "A2"
+#define WAVEFORM  "A2"          /* fast, 2-level: used while the cursor moves */
+#define WAVEFORM_FULL "GC16"    /* full grayscale: clears A2 ghosting when idle */
+#define IDLE_REFRESH_US 800000  /* GC16 cleanup after the pointer sits still this long */
 #define POLL_US   15000
 #define SCALE_NORMAL   3
 #define SCALE_LOW_RES  2
@@ -212,7 +214,7 @@ static rect fit(rect a)
 	return a;
 }
 
-static void refresh(rect a)
+static void refresh_wave(rect a, const char *wave)
 {
 	a = fit(a);
 	if (a.w <= 0 || a.h <= 0)
@@ -224,11 +226,16 @@ static void refresh(rect a)
 
 	pid_t pid = fork();
 	if (pid == 0) {
-		execl(g_fbink, g_fbink, "-q", "-s", reg, "-W", WAVEFORM, (char *)0);
+		execl(g_fbink, g_fbink, "-q", "-s", reg, "-W", wave, (char *)0);
 		_exit(127);
 	}
 	if (pid > 0)
 		waitpid(pid, NULL, 0);
+}
+
+static void refresh(rect a)
+{
+	refresh_wave(a, WAVEFORM);
 }
 
 static rect merge(rect a, rect b)
@@ -275,8 +282,13 @@ int main(void)
 	unsigned mask;
 	rect old = { 0, 0, 0, 0 };
 	int have = 0;
+	rect dirty = { 0, 0, 0, 0 };  /* union of A2-refreshed area since last cleanup */
+	int dirty_have = 0;
+	int idle_ticks = 0;
+	const int idle_limit = IDLE_REFRESH_US / POLL_US;
 
 	for (;;) {
+		int moved = 0;
 		if (XQueryPointer(dpy, root, &w1, &w2, &rx, &ry, &wx, &wy, &mask)) {
 			int x = rx, y = ry;
 			if (swap_xy) { int t = x; x = y; y = t; }
@@ -287,12 +299,23 @@ int main(void)
 				if (have)
 					unstash();
 				rect now = draw(x, y);
-				refresh(have ? merge(old, now) : now);
+				rect touched = have ? merge(old, now) : now;
+				refresh(touched);
+				dirty = dirty_have ? merge(dirty, touched) : touched;
+				dirty_have = 1;
 				old = now;
 				have = 1;
 				lx = x;
 				ly = y;
+				moved = 1;
 			}
+		}
+		idle_ticks = moved ? 0 : idle_ticks + 1;
+		/* Once the pointer has been still long enough, clear the A2 ghosting
+		 * over everything it touched with a single GC16 pass (once per rest). */
+		if (dirty_have && idle_ticks == idle_limit) {
+			refresh_wave(dirty, WAVEFORM_FULL);
+			dirty_have = 0;
 		}
 		usleep(POLL_US);
 	}
