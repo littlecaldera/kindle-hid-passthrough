@@ -277,6 +277,8 @@ class DaemonController:
         with self._cursor_lock:
             if self._cursor_proc is not None and self._cursor_proc.poll() is None:
                 return
+            # reap any stray overlay (e.g. orphaned by a prior daemon restart)
+            subprocess.run(['pkill', '-x', 'mousecursor'], capture_output=True)
             binary = os.path.join(config.base_path, 'scripts', 'mousecursor')
             errlog = os.path.join(config.base_path, 'cache', 'mousecursor.log')
             try:
@@ -291,16 +293,17 @@ class DaemonController:
     def request_cursor_stop(self):
         """Kill the mousecursor overlay binary (driven by pointer disconnect)."""
         with self._cursor_lock:
-            if self._cursor_proc is None or self._cursor_proc.poll() is not None:
-                self._cursor_proc = None
-                return
-            self._cursor_proc.terminate()
-            try:
-                self._cursor_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._cursor_proc.kill()
-                self._cursor_proc.wait()
+            proc = self._cursor_proc
             self._cursor_proc = None
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            # safety net: reap any stray/orphaned overlay too
+            subprocess.run(['pkill', '-x', 'mousecursor'], capture_output=True)
 
     # ---- Disconnect / Stop ----
 
