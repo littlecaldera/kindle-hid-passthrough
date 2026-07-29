@@ -9,7 +9,7 @@ from bumble.core import AdvertisingData, DeviceClass
 from bumble.gatt import GATT_HUMAN_INTERFACE_DEVICE_SERVICE
 from bumble.hci import Address
 
-from config import Protocol, config
+from config import Protocol, config, clean_device_name
 from logging_utils import log
 from transport import create_bumble_device
 
@@ -175,8 +175,7 @@ class Scanner:
                 except UnicodeDecodeError as e:
                     log.debug(f"Using Unknown name for malformed BLE advertisement from {addr_str}: {e}")
                     name = 'Unknown'
-                if isinstance(name, bytes):
-                    name = name.decode('utf-8', errors='replace')
+                name = clean_device_name(name) or 'Unknown'
 
             device = DiscoveredDevice(
                 address=addr_str,
@@ -232,10 +231,11 @@ class Scanner:
                     try:
                         name_data = eir_data.get(0x09) or eir_data.get(0x08)
                         if name_data:
-                            if isinstance(name_data, bytes):
-                                name = name_data.decode('utf-8', errors='replace')
-                            else:
-                                name = str(name_data)
+                            name = clean_device_name(name_data) or 'Unknown'
+                            raw = (name_data if isinstance(name_data, bytes)
+                                   else str(name_data).encode('utf-8', errors='replace'))
+                            if name != raw.decode('utf-8', errors='ignore').strip():
+                                log.info(f"  Cleaned EIR name for {addr_str}: {raw.hex()}")
                     except Exception:
                         pass
 
