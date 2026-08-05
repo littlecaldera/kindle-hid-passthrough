@@ -365,7 +365,8 @@ function HIDPassthrough:genMapperDeviceMenu(dev)
             text = _("Map a button…"),
             keep_menu_open = true,
             callback = function(touchmenu_instance)
-                self:mapperCapture(dev, touchmenu_instance)
+                self:mapperCapture(dev, touchmenu_instance,
+                    #touchmenu_instance.item_table_stack)
             end,
             separator = true,
         },
@@ -407,7 +408,9 @@ function HIDPassthrough:genMappingMenu(dev, section, key, label)
             text = _("Change action…"),
             keep_menu_open = true,
             callback = function(touchmenu_instance)
-                self:mapperPickAction(dev, section, key, label, touchmenu_instance)
+                -- This submenu sits one level below the device list.
+                self:pushActionPicker(dev, section, key, label,
+                    #touchmenu_instance.item_table_stack - 1, touchmenu_instance)
             end,
         },
         {
@@ -454,7 +457,7 @@ function HIDPassthrough:mapperEdit(transform)
     return true
 end
 
-function HIDPassthrough:mapperCapture(dev, touchmenu_instance)
+function HIDPassthrough:mapperCapture(dev, touchmenu_instance, device_depth)
     local mapper = self:_mapper()
     local node = mapper.findNode(dev.uniq or "")
     if not node then
@@ -488,7 +491,9 @@ function HIDPassthrough:mapperCapture(dev, touchmenu_instance)
             })
             return
         end
-        self:mapperPickAction(dev, section, key, label, touchmenu_instance)
+        if touchmenu_instance then
+            self:pushActionPicker(dev, section, key, label, device_depth, touchmenu_instance)
+        end
     end)
 end
 
@@ -591,68 +596,69 @@ function HIDPassthrough:_actionSections()
     return self._action_sections
 end
 
-function HIDPassthrough:mapperPickAction(dev, section, key, label, touchmenu_instance)
-    local mapper = self:_mapper()
+-- The action picker lives inside the TouchMenu we were called from rather
+-- than in a Menu of its own. A second full-screen widget layered over the
+-- TouchMenu fought it for input, which is why finishing any of these flows
+-- dumped you back at the top menu.
+--
+-- device_depth is the stack length at which item_table is the device list, so
+-- assigning can unwind straight back to it.
+function HIDPassthrough:pushActionPicker(dev, section, key, label, device_depth, touchmenu)
     local sections = self:_actionSections()
     if #sections == 0 then
         UIManager:show(InfoMessage:new{ text = _("No actions available.") })
         return
     end
 
-    local assign = function(item)
-        if self:mapperEdit(function(cur)
-            return mapper.setKey(cur, section, key, item.script)
-        end) then
-            -- Straight back to this device's list, with the new mapping in
-            -- it, so the next button is one tap away.
-            if touchmenu_instance then
-                touchmenu_instance.item_table = self:genMapperDeviceMenu(dev)
-                touchmenu_instance:updateItems()
-            end
-            UIManager:show(InfoMessage:new{
-                text = T(_("Mapped %1 to %2."), label, item.title),
-                timeout = 2,
-            })
-        end
-    end
-
-    local menu
-    local top = {}
+    local items = {}
     for dummy, group in ipairs(sections) do -- luacheck: ignore dummy
-        table.insert(top, {
+        table.insert(items, {
             text = T("%1  (%2)", group.title, tostring(#group.items)),
-            callback = function()
-                local items = {}
-                for dummy2, item in ipairs(group.items) do -- luacheck: ignore dummy2
-                    table.insert(items, {
-                        text = item.title,
-                        callback = function()
-                            UIManager:close(menu)
-                            assign(item)
+            sub_item_table_func = function()
+                local sub = {}
+                for dummy2, action in ipairs(group.items) do -- luacheck: ignore dummy2
+                    table.insert(sub, {
+                        text = action.title,
+                        keep_menu_open = true,
+                        callback = function(inner)
+                            self:mapperAssign(dev, section, key, label, action,
+                                device_depth, inner)
                         end,
                     })
                 end
-                -- Drives Menu's return arrow, which is enabled while paths
-                -- is non-empty.
-                table.insert(menu.paths, true)
-                menu:switchItemTable(group.title, items)
+                return sub
             end,
         })
     end
 
-    menu = Menu:new{
-        title = T(_("Action for %1"), label),
-        item_table = top,
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
-        is_popout = false,
-        onReturn = function()
-            menu.paths = {}
-            menu:switchItemTable(T(_("Action for %1"), label), top)
-        end,
-        onClose = function() UIManager:close(menu) end,
-    }
-    UIManager:show(menu)
+    -- Same two steps onMenuSelect takes for a sub_item_table, so the back
+    -- arrow and paging behave exactly as they do everywhere else.
+    table.insert(touchmenu.item_table_stack, touchmenu.item_table)
+    touchmenu.item_table = items
+    touchmenu:updateItems(1)
+end
+
+function HIDPassthrough:mapperAssign(dev, section, key, label, action, device_depth, touchmenu)
+    local mapper = self:_mapper()
+    if not self:mapperEdit(function(cur)
+        return mapper.setKey(cur, section, key, action.script)
+    end) then
+        return
+    end
+
+    if touchmenu then
+        -- Unwind to the device list, then rebuild it so the new mapping shows
+        -- and the next button is one tap away.
+        while #touchmenu.item_table_stack > device_depth do
+            touchmenu.item_table = table.remove(touchmenu.item_table_stack)
+        end
+        touchmenu.item_table = self:genMapperDeviceMenu(dev)
+        touchmenu:updateItems(1)
+    end
+    UIManager:show(InfoMessage:new{
+        text = T(_("Mapped %1 to %2."), label, action.title),
+        timeout = 2,
+    })
 end
 
 ------------------------------------------------------------------------------
