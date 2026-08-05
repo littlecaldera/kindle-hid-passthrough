@@ -376,23 +376,12 @@ function HIDPassthrough:genMapperDeviceMenu(dev)
         local section = "device." .. dev.id .. "." .. kind.section
         for dummy2, entry in ipairs(mapper.sectionKeys(text, section)) do -- luacheck: ignore dummy2
             local action = mapper.describeScript(entry.value, self:_koreaderTitles())
+            local label = T("%1 %2", kind.label, entry.key)
             table.insert(items, {
-                text = T("%1 %2  →  %3", kind.label, entry.key, action),
+                text = T("%1  →  %2", label, action),
                 keep_menu_open = true,
-                hold_callback = function(touchmenu_instance)
-                    UIManager:show(ConfirmBox:new{
-                        text = T(_("Remove the mapping for %1 %2?"), kind.label, entry.key),
-                        ok_text = _("Remove"),
-                        ok_callback = function()
-                            self:mapperEdit(function(cur)
-                                return mapper.removeKey(cur, section, entry.key)
-                            end)
-                            if touchmenu_instance then
-                                touchmenu_instance.item_table = self:genMapperDeviceMenu(dev)
-                                touchmenu_instance:updateItems()
-                            end
-                        end,
-                    })
+                sub_item_table_func = function()
+                    return self:genMappingMenu(dev, section, entry.key, label)
                 end,
                 ignored_by_menu_search = true,
             })
@@ -407,6 +396,43 @@ function HIDPassthrough:genMapperDeviceMenu(dev)
     end
     items.refresh_func = function() return self:genMapperDeviceMenu(dev) end
     return items
+end
+
+-- What one already-mapped control offers. A submenu rather than a hold, so
+-- removing is discoverable and TouchMenu's own back arrow gets you out.
+function HIDPassthrough:genMappingMenu(dev, section, key, label)
+    local mapper = self:_mapper()
+    return {
+        {
+            text = _("Change action…"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:mapperPickAction(dev, section, key, label, touchmenu_instance)
+            end,
+        },
+        {
+            text = _("Remove this mapping"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("Remove the mapping for %1?"), label),
+                    ok_text = _("Remove"),
+                    ok_callback = function()
+                        self:mapperEdit(function(cur)
+                            return mapper.removeKey(cur, section, key)
+                        end)
+                        if touchmenu_instance then
+                            -- Mark the parent stale so its refresh_func rebuilds.
+                            local stack = touchmenu_instance.item_table_stack
+                            local parent = stack and stack[#stack]
+                            if parent then parent.needs_refresh = true end
+                            touchmenu_instance:backToUpperMenu()
+                        end
+                    end,
+                })
+            end,
+        },
+    }
 end
 
 -- Re-fetch, transform, write back, reload. The helper serializes writers, but
@@ -486,9 +512,48 @@ end
 
 -- KOReader's own actions, plus the mapper's native ones for the cases KOReader
 -- cannot do (native reader page turns, screen taps, brightness over lipc).
+-- What people actually bind, in the order they reach for it. The auto.* ones
+-- try KOReader first and fall back to the native reader, so a favourite keeps
+-- working outside KOReader, which the KOReader event list cannot do.
+local FAVORITE_ACTIONS = {
+    { kind = "auto",     id = "next_page" },
+    { kind = "auto",     id = "prev_page" },
+    { kind = "auto",     id = "menu" },
+    { kind = "koreader", id = "night_mode" },
+    { kind = "auto",     id = "brightness 1" },
+    { kind = "auto",     id = "brightness -1" },
+    { kind = "auto",     id = "brightness_toggle" },
+    { kind = "koreader", id = "font_up 1" },
+    { kind = "koreader", id = "font_down 1" },
+    { kind = "koreader", id = "toggle_status_bar" },
+    { kind = "koreader", id = "rotate" },
+}
+
 function HIDPassthrough:_actionSections()
     if not self._action_sections then
         local sections = {}
+        local native = self:_mapper().actions()
+
+        if native then
+            local by_key = {}
+            for dummy, a in ipairs(native) do -- luacheck: ignore dummy
+                by_key[a.kind .. "\0" .. a.id] = a
+            end
+            local items = {}
+            for dummy, fav in ipairs(FAVORITE_ACTIONS) do -- luacheck: ignore dummy
+                local a = by_key[fav.kind .. "\0" .. fav.id]
+                if a then
+                    table.insert(items, {
+                        title = a.label,
+                        script = self:_mapper().actionScript(a),
+                    })
+                end
+            end
+            if #items > 0 then
+                table.insert(sections, { title = _("Favorites"), items = items })
+            end
+        end
+
         local ok, koactions = pcall(dofile,
             ffiutil.joinPath(self.path, "koreader_actions.lua"))
         if ok and type(koactions) == "table" then
@@ -506,11 +571,10 @@ function HIDPassthrough:_actionSections()
             logger.warn("HIDPassthrough: could not load koreader_actions:", koactions)
         end
 
-        local native = self:_mapper().actions()
         if native then
             local items = {}
             for dummy, a in ipairs(native) do -- luacheck: ignore dummy
-                -- The koreader.sh ones duplicate the list above.
+                -- The koreader.sh ones duplicate the KOReader list above.
                 if a.kind ~= "koreader" then
                     table.insert(items, {
                         title = T("%1 (%2)", a.label, a.kind),

@@ -11,9 +11,12 @@ import re
 import sys
 from pathlib import Path
 
-SECTIONS = [('general', 'General'), ('reader', 'Reader'), ('rolling', 'Reader (EPUB)'),
-            ('paging', 'Reader (PDF)'), ('filemanager', 'File browser'),
+# rolling (EPUB) and paging (PDF) fold into Reader: which one applies depends on
+# the open document, not on the mapping, so three menus was three ways to find
+# the same action.
+SECTIONS = [('general', 'General'), ('reader', 'Reader'), ('filemanager', 'File browser'),
             ('screen', 'Screen'), ('device', 'Device'), ('', 'Other')]
+MERGE_INTO_READER = ('rolling', 'paging')
 DEST = Path(__file__).resolve().parent.parent / \
     'koreader-plugin/hidpassthrough.koplugin/koreader_actions.lua'
 
@@ -38,6 +41,9 @@ def main():
             continue
         section = next((s for s, _ in SECTIONS
                         if s and re.search(r'\b%s\s*=\s*true' % s, attrs)), '')
+        if not section and any(re.search(r'\b%s\s*=\s*true' % s, attrs)
+                               for s in MERGE_INTO_READER):
+            section = 'reader'
         by.setdefault(section, []).append((ev.group(1), title.group(1)))
 
     out = ['-- Generated from KOReader frontend/dispatcher.lua, the category="none"',
@@ -49,7 +55,11 @@ def main():
         if key not in by:
             continue
         out.append('    { section = %s, actions = {' % lua_quote(label))
+        seen = set()
         for ev, title in sorted(by[key], key=lambda x: x[1].lower()):
+            if ev in seen:
+                continue
+            seen.add(ev)
             out.append('        { event = %s, title = %s },' % (lua_quote(ev), lua_quote(title)))
             total += 1
         out.append('    } },')
