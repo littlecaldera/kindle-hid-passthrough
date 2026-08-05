@@ -364,7 +364,9 @@ function HIDPassthrough:genMapperDeviceMenu(dev)
         {
             text = _("Map a button…"),
             keep_menu_open = true,
-            callback = function() self:mapperCapture(dev) end,
+            callback = function(touchmenu_instance)
+                self:mapperCapture(dev, touchmenu_instance)
+            end,
             separator = true,
         },
     }
@@ -426,7 +428,7 @@ function HIDPassthrough:mapperEdit(transform)
     return true
 end
 
-function HIDPassthrough:mapperCapture(dev)
+function HIDPassthrough:mapperCapture(dev, touchmenu_instance)
     local mapper = self:_mapper()
     local node = mapper.findNode(dev.uniq or "")
     if not node then
@@ -460,7 +462,7 @@ function HIDPassthrough:mapperCapture(dev)
             })
             return
         end
-        self:mapperPickAction(section, key, label)
+        self:mapperPickAction(dev, section, key, label, touchmenu_instance)
     end)
 end
 
@@ -525,7 +527,7 @@ function HIDPassthrough:_actionSections()
     return self._action_sections
 end
 
-function HIDPassthrough:mapperPickAction(section, key, label)
+function HIDPassthrough:mapperPickAction(dev, section, key, label, touchmenu_instance)
     local mapper = self:_mapper()
     local sections = self:_actionSections()
     if #sections == 0 then
@@ -537,33 +539,40 @@ function HIDPassthrough:mapperPickAction(section, key, label)
         if self:mapperEdit(function(cur)
             return mapper.setKey(cur, section, key, item.script)
         end) then
+            -- Straight back to this device's list, with the new mapping in
+            -- it, so the next button is one tap away.
+            if touchmenu_instance then
+                touchmenu_instance.item_table = self:genMapperDeviceMenu(dev)
+                touchmenu_instance:updateItems()
+            end
             UIManager:show(InfoMessage:new{
                 text = T(_("Mapped %1 to %2."), label, item.title),
-                timeout = 3,
+                timeout = 2,
             })
         end
     end
 
     local menu
-    local function showItems(group)
-        local items = {}
-        for dummy, item in ipairs(group.items) do -- luacheck: ignore dummy
-            table.insert(items, {
-                text = item.title,
-                callback = function()
-                    UIManager:close(menu)
-                    assign(item)
-                end,
-            })
-        end
-        menu:switchItemTable(T(_("Action for %1"), label), items)
-    end
-
     local top = {}
     for dummy, group in ipairs(sections) do -- luacheck: ignore dummy
         table.insert(top, {
             text = T("%1  (%2)", group.title, tostring(#group.items)),
-            callback = function() showItems(group) end,
+            callback = function()
+                local items = {}
+                for dummy2, item in ipairs(group.items) do -- luacheck: ignore dummy2
+                    table.insert(items, {
+                        text = item.title,
+                        callback = function()
+                            UIManager:close(menu)
+                            assign(item)
+                        end,
+                    })
+                end
+                -- Drives Menu's return arrow, which is enabled while paths
+                -- is non-empty.
+                table.insert(menu.paths, true)
+                menu:switchItemTable(group.title, items)
+            end,
         })
     end
 
@@ -573,6 +582,10 @@ function HIDPassthrough:mapperPickAction(section, key, label)
         width = Screen:getWidth(),
         height = Screen:getHeight(),
         is_popout = false,
+        onReturn = function()
+            menu.paths = {}
+            menu:switchItemTable(T(_("Action for %1"), label), top)
+        end,
         onClose = function() UIManager:close(menu) end,
     }
     UIManager:show(menu)
