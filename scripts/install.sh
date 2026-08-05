@@ -266,7 +266,7 @@ installKOReaderPlugin()
     return 1
   fi
 
-  for f in main.lua _meta.lua event_map_extra.lua mapper.lua; do
+  for f in main.lua _meta.lua event_map_extra.lua mapper.lua koreader_actions.lua; do
     if [ ! -f "$DEST/$f" ]; then
       echo "ERROR: $f is missing from $DEST" >&2
       return 1

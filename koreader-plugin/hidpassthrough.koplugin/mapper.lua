@@ -275,4 +275,19 @@ function M.actionScript(action)
     return string.format("%s/%s.sh %s", M.SCRIPTS, action.kind, action.id)
 end
 
+-- Any KOReader event the HTTP Inspector accepts, which is the whole
+-- no-argument half of KOReader's Dispatcher list.
+function M.koreaderEventScript(event)
+    return string.format("%s/koreader.sh event %s", M.SCRIPTS, event)
+end
+
+-- Human label for a configured value, for the mapping list.
+function M.describeScript(script, koreader_titles)
+    local event = script:match("koreader%.sh event ([%w_]+)%s*$")
+    if event then
+        return koreader_titles and koreader_titles[event] or event
+    end
+    return script:match("([^/]+)$") or script
+end
+
 return M
