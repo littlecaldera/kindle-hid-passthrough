@@ -279,7 +279,7 @@ uninstallAll()
 {
   echo ""
   echo "=== Uninstall ==="
-  printf "This will stop the daemon, remove udev/upstart/WAF app, and delete the install directory.\n"
+  printf "This will stop the daemon, remove udev/upstart/WAF app, Button Mapper, and delete the install directory.\n"
   # Only prompt when there is someone to answer. Package managers run this
   # without a tty and have already asked in their own UI.
   if [ -t 0 ]; then
@@ -318,6 +318,8 @@ EOF
 
   /usr/sbin/mntroot ro
 
+  uninstallButtonMapper
+
   if PLUGINS_DIR=$(koreaderPluginDir); then
     echo " -> Removing KOReader plugin"
     rm -rf "$PLUGINS_DIR/hidpassthrough.koplugin"
@@ -329,11 +331,23 @@ EOF
 
   echo ""
   echo "Uninstall complete. Reboot recommended."
-  # Left alone on purpose, it is a separate tool that may predate this install.
-  if [ -f "$MAPPER_DIR/uninstall.sh" ]; then
-    echo "Button Mapper was left installed. Remove it with:"
-    echo "  sh $MAPPER_DIR/uninstall.sh"
+}
+
+# Button Mapper is the mapping backend now, not an optional extra, so it goes
+# with everything else. Its own uninstaller owns the upstart job, the WAF app
+# and the install dir, so defer to it rather than duplicating any of that.
+uninstallButtonMapper()
+{
+  if [ ! -f "$MAPPER_DIR/uninstall.sh" ]; then
+    return 0
   fi
+  echo " -> Removing Button Mapper"
+  if /bin/sh "$MAPPER_DIR/uninstall.sh" >/dev/null 2>&1; then
+    echo " -> Ready."
+  else
+    echo " -> WARNING: Button Mapper uninstall failed, remove $MAPPER_DIR by hand"
+  fi
+  return 0
 }
 
 print_menu()
@@ -363,6 +377,7 @@ if [ $# -gt 0 ]; then
     installWAFApp)      installWAFApp; exit $? ;;
     installKOReaderPlugin) installKOReaderPlugin; exit $? ;;
     installButtonMapper) installButtonMapper; exit $? ;;
+    uninstallButtonMapper) uninstallButtonMapper; exit $? ;;
     uninstallAll)       uninstallAll; exit $? ;;
     *) echo "Unknown action: $1" >&2; exit 1 ;;
   esac
