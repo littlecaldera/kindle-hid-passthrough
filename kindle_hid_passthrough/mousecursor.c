@@ -26,6 +26,7 @@
 #define WAVEFORM  "A2"          /* fast 2-level: used while the cursor moves */
 #define WAVEFORM_FULL "GC16"    /* full grayscale: clears A2 ghosting when idle */
 #define IDLE_REFRESH_US 5000000 /* GC16 cleanup after the pointer sits still this long */
+#define REFRESH_MIN_US  100000  /* min gap between panel updates while moving (~10Hz) */
 #define POLL_US   15000         /* poll/refresh cadence */
 #define SCALE_NORMAL   3
 #define SCALE_LOW_RES  2
@@ -294,8 +295,11 @@ int main(void)
 	int have = 0;
 	rect dirty = { 0, 0, 0, 0 };  /* union of A2-refreshed area since last cleanup */
 	int dirty_have = 0;
+	rect pending = { 0, 0, 0, 0 };  /* moved but not yet pushed to the panel */
+	int pending_have = 0, since_refresh = 0;
 	int idle_ticks = 0;
 	const int idle_limit = IDLE_REFRESH_US / POLL_US;
+	const int refresh_every = REFRESH_MIN_US / POLL_US;
 
 	for (;;) {
 		int moved = 0;
@@ -310,15 +314,24 @@ int main(void)
 					unstash();
 				rect now = draw(x, y);
 				rect touched = have ? merge(old, now) : now;
-				refresh(touched);
-				dirty = dirty_have ? merge(dirty, touched) : touched;
-				dirty_have = 1;
+				pending = pending_have ? merge(pending, touched) : touched;
+				pending_have = 1;
 				old = now;
 				have = 1;
 				lx = x;
 				ly = y;
 				moved = 1;
 			}
+		}
+		/* Each refresh forks fbink and waits on it (~20ms), so refreshing every
+		 * poll saturates the CPU while the pointer moves. Coalesce instead: at
+		 * most one panel update per refresh_every ticks, and flush on stop. */
+		if (pending_have && (++since_refresh >= refresh_every || !moved)) {
+			refresh(pending);
+			dirty = dirty_have ? merge(dirty, pending) : pending;
+			dirty_have = 1;
+			pending_have = 0;
+			since_refresh = 0;
 		}
 		idle_ticks = moved ? 0 : idle_ticks + 1;
 		/* Once the pointer has been still long enough, clear the A2 ghosting
