@@ -74,6 +74,58 @@ def strip_digitizer_collections(descriptor: bytes) -> bytes:
         logger.info(f"Stripped digitizer collection(s) ({len(descriptor)} -> {len(result)} bytes)")
     return result
 
+def descriptor_is_pointer(descriptor: bytes) -> bool:
+    """True if the descriptor declares a Generic Desktop Mouse/Pointer app collection.
+
+    Walks HID items tracking the current Usage Page and last Usage; when a
+    top-level Application collection opens, checks whether it was introduced by
+    Generic Desktop (0x01) Mouse (0x02) or Pointer (0x01).
+    """
+    i = 0
+    usage_page = None
+    last_usage = None
+    depth = 0
+
+    while i < len(descriptor):
+        b = descriptor[i]
+        size = b & 0x03
+        if size == 3:
+            size = 4
+        item_type = (b >> 2) & 0x03
+        tag = (b >> 4) & 0x0F
+
+        if i + 1 + size > len(descriptor):
+            break
+
+        if size == 1:
+            val = descriptor[i + 1]
+        elif size == 2:
+            val = int.from_bytes(descriptor[i + 1:i + 3], 'little')
+        elif size == 4:
+            val = int.from_bytes(descriptor[i + 1:i + 5], 'little')
+        else:
+            val = 0
+
+        if item_type == 1 and tag == 0:        # Global: Usage Page
+            usage_page = val
+        elif item_type == 2 and tag == 0:      # Local: Usage
+            last_usage = val
+        elif item_type == 0 and tag == 10:     # Main: Collection
+            if depth == 0 and val == 0x01 and usage_page == 0x01 \
+                    and last_usage in (0x01, 0x02):
+                return True
+            depth += 1
+        elif item_type == 0 and tag == 12:     # Main: End Collection
+            depth -= 1
+
+        if item_type == 0:                     # any Main item clears locals
+            last_usage = None
+
+        i += 1 + size
+
+    return False
+
+
 # UHID constants from linux/uhid.h
 UHID_CREATE2 = 11
 UHID_DESTROY = 1
