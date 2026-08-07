@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import signal
+import subprocess
 import sys
 import threading
 
@@ -31,6 +32,8 @@ class HIDDaemon:
         self._suspended = False
         self._resume_event = asyncio.Event()
         self._paired_host = None
+        # Set in main(): called with True/False as a pointer device connects/leaves.
+        self.on_pointer_change = None
 
     @property
     def connection_state(self) -> dict:
@@ -156,12 +159,14 @@ class HIDDaemon:
                     logger.info("=== Continuing with paired device ===")
                     self.host = self._paired_host
                     self._paired_host = None
+                    self.host.on_pointer_change = self.on_pointer_change
                     self._host_task = asyncio.create_task(
                         self.host.continue_after_pairing()
                     )
                 else:
                     logger.info("=== Starting connection ===")
                     self.host = HIDHost()
+                    self.host.on_pointer_change = self.on_pointer_change
                     self._host_task = asyncio.create_task(
                         self.host.run()
                     )
@@ -247,6 +252,17 @@ async def main():
     daemon = HIDDaemon()
     controller = DaemonController(daemon)
     controller.loop = asyncio.get_event_loop()
+
+    # Reap any cursor overlay orphaned by a previous daemon before we start.
+    subprocess.run(['pkill', '-x', 'mousecursor'], capture_output=True)
+
+    # Auto-toggle the mouse cursor overlay as pointer devices connect/disconnect.
+    def _cursor_for_pointer(active):
+        if active:
+            controller.request_cursor_start()
+        else:
+            controller.request_cursor_stop()
+    daemon.on_pointer_change = _cursor_for_pointer
 
     # Start embedded API server
     server = APIServer(('127.0.0.1', PORT), RequestHandler)

@@ -9,6 +9,7 @@ disconnect) from the HTTP server thread via asyncio.run_coroutine_threadsafe().
 import asyncio
 import logging
 import os
+import subprocess
 import threading
 
 from bt_setup import chip
@@ -49,6 +50,10 @@ class DaemonController:
         self._devices_mtime = 0
         self._devices_lock = threading.Lock()
 
+        # Mouse cursor overlay process
+        self._cursor_proc = None
+        self._cursor_lock = threading.Lock()
+
     def get_status(self) -> dict:
         """Thread-safe read of daemon state. Called from HTTP thread."""
         devices = self._get_devices_cached()
@@ -59,6 +64,7 @@ class DaemonController:
             "device_count": len(devices),
             "scanning": self.is_scanning,
             "pairing": self.is_pairing,
+            "cursor_running": self.cursor_running(),
         }
 
         conn = self.daemon.connection_state
@@ -259,6 +265,45 @@ class DaemonController:
     def request_clear_cache(self) -> int:
         """Clear all descriptor cache files. Returns count of files removed."""
         return DeviceCache(config.cache_dir).clear()
+
+    # ---- Mouse Cursor Overlay ----
+
+    def cursor_running(self) -> bool:
+        with self._cursor_lock:
+            return self._cursor_proc is not None and self._cursor_proc.poll() is None
+
+    def request_cursor_start(self):
+        """Launch the mousecursor overlay binary (driven by pointer connect)."""
+        with self._cursor_lock:
+            if self._cursor_proc is not None and self._cursor_proc.poll() is None:
+                return
+            # reap any stray overlay (e.g. orphaned by a prior daemon restart)
+            subprocess.run(['pkill', '-x', 'mousecursor'], capture_output=True)
+            binary = os.path.join(config.base_path, 'scripts', 'mousecursor')
+            errlog = os.path.join(config.base_path, 'cache', 'mousecursor.log')
+            try:
+                err = open(errlog, 'ab')
+                self._cursor_proc = subprocess.Popen(
+                    [binary], stdout=subprocess.DEVNULL, stderr=err)
+                logger.info(f"Cursor overlay started (pid {self._cursor_proc.pid})")
+            except OSError as e:
+                logger.error(f"Cursor overlay failed to launch ({binary}): {e}")
+                self._cursor_proc = None
+
+    def request_cursor_stop(self):
+        """Kill the mousecursor overlay binary (driven by pointer disconnect)."""
+        with self._cursor_lock:
+            proc = self._cursor_proc
+            self._cursor_proc = None
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            # safety net: reap any stray/orphaned overlay too
+            subprocess.run(['pkill', '-x', 'mousecursor'], capture_output=True)
 
     # ---- Disconnect / Stop ----
 
