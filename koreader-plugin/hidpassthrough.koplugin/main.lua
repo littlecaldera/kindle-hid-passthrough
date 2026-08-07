@@ -376,7 +376,7 @@ function HIDPassthrough:genMapperDeviceMenu(dev)
     for dummy, kind in ipairs(MAPPER_KINDS) do -- luacheck: ignore dummy
         local section = "device." .. dev.id .. "." .. kind.section
         for dummy2, entry in ipairs(mapper.sectionKeys(text, section)) do -- luacheck: ignore dummy2
-            local action = mapper.describeScript(entry.value, self:_koreaderTitles())
+            local action = mapper.describeScript(entry.value, self:_actionTitles())
             local label = T("%1 %2", kind.label, entry.key)
             table.insert(items, {
                 text = T("%1  →  %2", label, action),
@@ -390,8 +390,11 @@ function HIDPassthrough:genMapperDeviceMenu(dev)
     end
 
     if #items == 1 then
+        -- Only a gamepad gets a layout for free; the mapper leaves anything
+        -- else alone until something here names a button, so don't promise
+        -- defaults that a keyboard will never have.
         table.insert(items, {
-            text = _("(defaults active — map a button to customize)"),
+            text = _("(nothing mapped — gamepads get defaults)"),
             enabled = false,
         })
     end
@@ -472,7 +475,10 @@ function HIDPassthrough:mapperCapture(dev, touchmenu_instance, device_depth)
     }
     UIManager:show(msg)
     -- Painted first; the capture request then blocks the UI until a press
-    -- or the helper's timeout.
+    -- or the helper's timeout. Whatever the menu was showing then is what
+    -- the picker has to be pushed onto, so remember it and check on the way
+    -- back rather than pushing onto whatever the user browsed to meanwhile.
+    local menu_at_start = touchmenu_instance and touchmenu_instance.item_table
     UIManager:scheduleIn(0.1, function()
         local cap, err = mapper.capture(node, 8000)
         UIManager:close(msg)
@@ -491,28 +497,36 @@ function HIDPassthrough:mapperCapture(dev, touchmenu_instance, device_depth)
             })
             return
         end
-        if touchmenu_instance then
-            self:pushActionPicker(dev, section, key, label, device_depth, touchmenu_instance)
+        if not touchmenu_instance then return end
+        if touchmenu_instance.item_table ~= menu_at_start then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Captured %1. Open it from the list to pick an action."), label),
+                timeout = 3,
+            })
+            return
         end
+        self:pushActionPicker(dev, section, key, label, device_depth, touchmenu_instance)
     end)
 end
 
 -- Event name to title, for labelling mappings already in the config.
-function HIDPassthrough:_koreaderTitles()
-    if not self._koreader_titles then
+-- Every script the picker can write, mapped back to the wording it was picked
+-- under, so an already-configured mapping reads as "Toggle night mode" rather
+-- than "koreader.sh night_mode". Keyed by script line and, for KOReader events,
+-- by bare event name too, since those can also arrive from the mapper's own app.
+function HIDPassthrough:_actionTitles()
+    if not self._action_titles then
         local titles = {}
-        local ok, koactions = pcall(dofile,
-            ffiutil.joinPath(self.path, "koreader_actions.lua"))
-        if ok and type(koactions) == "table" then
-            for dummy, group in ipairs(koactions) do -- luacheck: ignore dummy
-                for dummy2, a in ipairs(group.actions) do -- luacheck: ignore dummy2
-                    titles[a.event] = a.title
-                end
+        for dummy, group in ipairs(self:_actionSections()) do -- luacheck: ignore dummy
+            for dummy2, item in ipairs(group.items) do -- luacheck: ignore dummy2
+                titles[item.script] = item.title
+                local event = item.script:match("koreader%.sh event ([%w_]+)$")
+                if event then titles[event] = item.title end
             end
         end
-        self._koreader_titles = titles
+        self._action_titles = titles
     end
-    return self._koreader_titles
+    return self._action_titles
 end
 
 -- KOReader's own actions, plus the mapper's native ones for the cases KOReader
@@ -576,19 +590,28 @@ function HIDPassthrough:_actionSections()
             logger.warn("HIDPassthrough: could not load koreader_actions:", koactions)
         end
 
+        -- Split by what the script actually drives rather than lumping both
+        -- under one "native" heading: auto.* try KOReader first and fall back
+        -- to the Kindle reader, kindle.* only ever drive the Kindle reader.
+        -- The koreader.* ones duplicate the KOReader list above.
+        local NATIVE_GROUPS = {
+            { kind = "auto",   title = _("Works outside KOReader too") },
+            { kind = "kindle", title = _("Native Kindle reader") },
+        }
         if native then
-            local items = {}
-            for dummy, a in ipairs(native) do -- luacheck: ignore dummy
-                -- The koreader.sh ones duplicate the KOReader list above.
-                if a.kind ~= "koreader" then
-                    table.insert(items, {
-                        title = T("%1 (%2)", a.label, a.kind),
-                        script = self:_mapper().actionScript(a),
-                    })
+            for dummy, group in ipairs(NATIVE_GROUPS) do -- luacheck: ignore dummy
+                local items = {}
+                for dummy2, a in ipairs(native) do -- luacheck: ignore dummy2
+                    if a.kind == group.kind then
+                        table.insert(items, {
+                            title = a.label,
+                            script = self:_mapper().actionScript(a),
+                        })
+                    end
                 end
-            end
-            if #items > 0 then
-                table.insert(sections, { title = _("Native reader / device"), items = items })
+                if #items > 0 then
+                    table.insert(sections, { title = group.title, items = items })
+                end
             end
         end
         self._action_sections = sections
@@ -833,6 +856,24 @@ function HIDPassthrough:showInfo()
         end
         if body:find('"pairing"%s*:%s*true') then
             table.insert(lines, _("Currently pairing…"))
+        end
+    end
+
+    -- The mapper is the other half of this plugin now, so a status panel that
+    -- only covers the Bluetooth side answers half the question.
+    table.insert(lines, "")
+    local mapper = self:_mapper()
+    if not mapper.installed() then
+        table.insert(lines, _("Button Mapper: not installed"))
+    else
+        local status = mapper.status()
+        if not status then
+            table.insert(lines, _("Button Mapper: helper not reachable"))
+        else
+            local running = status.running and _("running") or _("stopped")
+            local version = status.version or "?"
+            if status.build then version = version .. "-" .. status.build end
+            table.insert(lines, T(_("Button Mapper: %1 (%2)"), running, version))
         end
     end
 
@@ -1497,16 +1538,23 @@ function HIDPassthrough:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 callback = function()
                     UIManager:show(InfoMessage:new{
-                        text = T(_([[Manages the kindle-hid-passthrough Bluetooth HID daemon.
+                        text = T(_([[Pairing runs on the kindle-hid-passthrough Bluetooth HID daemon,
+key mappings run on kindle-button-mapper. Both must already be installed.
 
-Binary: %1
-API:    http://%2:%3
+HID daemon: %1
+API:        http://%2:%3
 
-The daemon must already be installed on the device. See:
-https://github.com/zampierilucas/kindle-hid-passthrough]]),
+Button Mapper: %4
+API:           http://%5:%6
+
+https://github.com/zampierilucas/kindle-hid-passthrough
+https://github.com/zampierilucas/kindle-button-mapper-rs]]),
                             self.DAEMON_BINARY,
                             self.API_HOST,
-                            tostring(self.API_PORT)),
+                            tostring(self.API_PORT),
+                            self:_mapper().BIN,
+                            self:_mapper().HOST,
+                            tostring(self:_mapper().PORT)),
                     })
                 end,
             },

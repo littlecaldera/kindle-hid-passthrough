@@ -75,6 +75,11 @@ function M.health()
     return requestJson("GET", "/health") ~= nil
 end
 
+-- Daemon state and build, for the status panel. nil when nothing is listening.
+function M.status()
+    return requestJson("GET", "/status")
+end
+
 -- Spawn the helper the way MapperManager.sh does if it isn't up yet.
 function M.ensureHelper()
     if M.health() then return true end
@@ -281,12 +286,19 @@ function M.koreaderEventScript(event)
     return string.format("%s/koreader.sh event %s", M.SCRIPTS, event)
 end
 
--- Human label for a configured value, for the mapping list.
-function M.describeScript(script, koreader_titles)
-    local event = script:match("koreader%.sh event ([%w_]+)%s*$")
+-- Human label for a configured value, for the mapping list. `titles` maps both
+-- KOReader event names and whole script lines to the wording the picker used,
+-- so the list reads back the way it was set rather than as a shell command.
+function M.describeScript(script, titles)
+    script = script:gsub("%s+$", "")
+    local event = script:match("koreader%.sh event ([%w_]+)$")
     if event then
-        return koreader_titles and koreader_titles[event] or event
+        return titles and titles[event] or event
     end
+    local known = titles and titles[script]
+    if known then return known end
+    -- Something hand-written or from another tool. The bare command is the
+    -- most useful thing left to show.
     return script:match("([^/]+)$") or script
 end
 
