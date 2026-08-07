@@ -8,7 +8,11 @@
 
 A userspace Bluetooth HID host for Amazon Kindle e-readers. Connects Bluetooth HID devices (gamepads, keyboards, remotes) and passes input directly to Linux via UHID.
 
-> **Note:** This project is normally paired with [kindle-button-mapper-rs](https://github.com/zampierilucas/kindle-button-mapper-rs), which maps the connected controller's buttons to Kindle actions (page turns, etc.). Without it, gamepads and remotes connect but don't do anything useful.
+> **Note:** On its own this project only connects a device. Something still has to decide what its buttons *do*, or gamepads and remotes pair fine and then sit there.
+>
+> **If you only care about KOReader**, use the bundled [KOReader plugin](koreader-plugin/README.md). Bind any button to any KOReader action from inside KOReader, nothing else to install. That covers most people.
+>
+> **If you want mappings that work system-wide**, outside KOReader as well as in it, pair this with [kindle-button-mapper-rs](https://github.com/zampierilucas/kindle-button-mapper-rs). More setup, more power, and the only option for analog sticks.
 
 ## Overview
 
@@ -38,10 +42,15 @@ As this project replaces the original Bluetooth stack, you can't use the default
 ## Requirements
 
 - Jailbroken Kindle
+- [Hotfix](https://github.com/KindleModding/Hotfix/releases/tag/v2.3.7) (only for BTManager) — it's what gives the Kindle scriptlet support, and without it the BTManager entry never shows up on the home screen. Kindles jailbroken with older methods don't have scriptlets at all.
 
 Kernels without UHID support are handled automatically: the daemon loads a bundled `uhid.ko` at startup (see [Kernel Modules](#kernel-modules)).
 
 ## Installation
+
+### Video guide
+
+Community walkthrough by [@jencaps89](https://www.tiktok.com/@jencaps89) showing the whole setup as a Bluetooth page turner, [watch it on TikTok](https://www.tiktok.com/@jencaps89/video/7658167614736223496) or through the [embedded player](https://www.tiktok.com/player/v1/7658167614736223496) if you'd rather not log in.
 
 ### KindleForge (recommended)
 
@@ -49,37 +58,61 @@ Install directly from [KindleForge](https://github.com/KindleTweaks/KindleForge)
 
 ### Manual install
 
-1. Download the latest release from [GitHub Releases](https://github.com/zampierilucas/kindle-hid-passthrough/releases):
+1. Download the latest release from [GitHub Releases](https://github.com/zampierilucas/kindle-hid-passthrough/releases) and unpack it somewhere other than the install directory:
    ```bash
    wget https://github.com/zampierilucas/kindle-hid-passthrough/releases/latest/download/kindle-hid-passthrough-armv7.tar.gz
-   tar -xzf kindle-hid-passthrough-armv7.tar.gz -C /mnt/us/kindle_hid_passthrough/
+   mkdir -p /mnt/us/khp-release
+   tar -xzf kindle-hid-passthrough-armv7.tar.gz -C /mnt/us/khp-release
    ```
 
    The release contains a `dist/` directory with a bundled Python runtime and all dependencies — no Python installation required on the Kindle.
 
 2. Run the interactive installer:
    ```bash
-   cd /mnt/us/kindle_hid_passthrough
-   sh scripts/install.sh
+   sh /mnt/us/khp-release/scripts/install.sh
    ```
 
    This lets you pair devices, install udev rules, set up autostart, install the BTManager app, and set keyboard layouts.
 
+### Updating
+
+Same two steps, option 1 handles both cases. It notices an existing install, stops the daemon, replaces the program files and leaves your `config.ini`, paired devices and pairing keys alone. A new default config is written to `config.ini.new` so you can diff it against yours. There is no need to uninstall first.
+
+Non-interactive, for scripts:
+```bash
+sh /mnt/us/khp-release/scripts/install.sh update
+```
+
+Unpacking to a staging directory is preferred because it lets the installer replace the program files wholesale, so anything dropped between releases goes with them. If you unpack straight over `/mnt/us/kindle_hid_passthrough` instead, stop the daemon first with `stop hid-passthrough`. A running daemon holds `dist/ld-linux-armhf.so.3` open, tar stops at that file, and the update is left half applied.
+
 ### BTManager
 
-A built-in Kindle app for managing Bluetooth HID devices from the touchscreen — no SSH needed. Scan for devices, pair, remove, start/stop the daemon, all from the Kindle UI.
+A built-in Kindle app for managing Bluetooth HID devices from the touchscreen — no SSH needed. Scan for devices, pair, connect, remove, toggle the daemon, all from the Kindle UI.
 
-![BTManager scan & pair](docs/screenshots/btmanager-scan.png)
+<p align="center">
+  <img src="docs/screenshots/btmanager-main.png" width="32%" alt="Paired devices">
+  <img src="docs/screenshots/btmanager-scan.png" width="32%" alt="Scanning">
+  <img src="docs/screenshots/btmanager-device.png" width="32%" alt="Device details">
+</p>
+
+Paired list, scanning for nearby BLE and Classic HID devices, and the per-device view with status, protocol, address, connect and remove.
 
 Installed automatically via KindleForge. For manual installs, use option 6 in `scripts/install.sh`.
 
+The **Start on boot** toggle at the bottom installs or removes the upstart job. It is off by default, so the daemon only runs while you use it, which leaves the Bluetooth radio free for audio. Turn it on if you want your keyboard connected right after a reboot.
+
 ### KOReader plugin
 
-If you use KOReader, a bundled plugin gives you the same scan / pair / connect / disconnect / logs / cache controls from inside KOReader — no need to exit. Open via **cog icon (Settings) → Network → HID Passthrough**.
+If you use KOReader, a bundled plugin gives you the same scan / pair / connect / disconnect / logs / cache controls from inside KOReader — no need to exit. Open via **cog icon (Settings) → Network → BT Manager - HID Passthrough**.
 
-![KOReader plugin menu](koreader-plugin/screenshots/menu.png)
+It also maps keys. Press a button on a connected keyboard, gamepad or remote and bind it to any KOReader action, in-process, with no extra daemon and no HTTP Inspector.
 
-Auto-installed via the interactive installer when `/mnt/us/koreader/plugins/` exists. See [`koreader-plugin/README.md`](koreader-plugin/README.md) for details.
+<p align="center">
+  <img src="koreader-plugin/screenshots/menu.png" width="48%" alt="Plugin menu">
+  <img src="koreader-plugin/screenshots/key-mappings.png" width="48%" alt="Key mappings">
+</p>
+
+For most people this is all you need, and it's the simpler half of the note at the top of this README. Auto-installed via the interactive installer when `/mnt/us/koreader/plugins/` exists. Requires KOReader 2026.07 or newer, which handles keyboard hot-plug natively. See [`koreader-plugin/README.md`](koreader-plugin/README.md) for details.
 
 ## Usage
 

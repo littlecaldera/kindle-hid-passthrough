@@ -92,6 +92,12 @@ sh /mnt/us/kindle_hid_passthrough/illusion/install-waf-app.sh
 
 udev rules are not installed. Install them (see above) so the system recognizes the device as a keyboard.
 
+### BTManager doesn't show up on the home screen
+
+BTManager is launched by a scriptlet, and scriptlets need the [Hotfix](https://github.com/KindleModding/Hotfix/releases/tag/v2.3.7) package. Kindles jailbroken with older methods don't support them at all, so the app installs fine and then never appears. Install the hotfix as an mrpi package and the entry shows up.
+
+Everything else works without it — start the daemon over SSH or from the KOReader plugin and page turns behave normally.
+
 ### Daemon won't start
 
 Check if the Bluetooth module is loaded:
@@ -121,4 +127,30 @@ Try clearing the cache and re-pairing:
 ```bash
 rm -rf /mnt/us/kindle_hid_passthrough/cache/*.json
 /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --pair
+```
+
+### Missed keypresses after idle on i.MX Kindles (8th-10th gen)
+
+Presses a few seconds apart work, but one after 10-30 seconds of reading does
+nothing, then recovers on its own. The SoC is entering a cpuidle state whose
+exit latency is longer than the UART RX FIFO can cover at 2 Mbaud, so the first
+bytes of the HCI packet are lost.
+
+The daemon holds a CPU latency ceiling while the transport is open. Confirm it
+took effect:
+```bash
+grep -E "cpuidle budget|CPU latency|cpuidle state" /var/log/hid_passthrough.log
+```
+
+Check what the kernel offers and how deep each state is:
+```bash
+for s in /sys/devices/system/cpu/cpu0/cpuidle/state*; do
+    echo "$(basename $s) $(cat $s/name) $(cat $s/latency)us disable=$(cat $s/disable)"
+done
+ls -l /dev/cpu_dma_latency
+```
+
+Resync messages mean bytes were lost but the parser recovered:
+```bash
+grep "HCI resync" /var/log/hid_passthrough.log
 ```
