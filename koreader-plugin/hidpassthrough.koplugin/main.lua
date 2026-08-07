@@ -5,12 +5,10 @@ Manage the kindle-hid-passthrough daemon and map keys from inside KOReader.
 --]]
 
 local ConfirmBox = require("ui/widget/confirmbox")
-local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local LuaSettings = require("luasettings")
 local Menu = require("ui/widget/menu")
 local PluginShare = require("pluginshare")
 local PowerD = Device:getPowerDevice()
@@ -121,60 +119,6 @@ end
 -- Not built on hotkeys.koplugin: it returns disabled unless hasScreenKB or
 -- hasKeyboard, which no modern Kindle sets, and PluginLoader caches that.
 
-local MODIFIER_KEYS = {
-    Shift = true, Ctrl = true, Alt = true, Meta = true, Sym = true,
-    ScreenKB = true, LCtrl = true, LAlt = true, RAlt = true, LMeta = true,
-    RMeta = true, CapsLock = true,
-}
-
--- Fixed order so a given combo always serializes to the same id.
-local MOD_ORDER = { "Shift", "Ctrl", "Alt", "Meta", "Sym", "ScreenKB" }
-
--- Shortcuts, so the common bindings don't mean paging through the full tree.
--- By Dispatcher key, never by title, so renames and translations come free.
-local COMMON_ACTIONS = {
-    "hidpassthrough_next_page",
-    "hidpassthrough_prev_page",
-    "hidpassthrough_close",
-    "toggle_frontlight",
-    "night_mode",
-    "show_menu",
-    "toc",
-    "bookmarks",
-    "toggle_bookmark",
-    "iterate_rotation",
-    "back",
-}
-
--- "F13", "Shift+F13". Reads modifiers off the Key hash, not key.modifiers,
--- which is a live reference to Input's table rather than a snapshot.
-local function keyToId(key)
-    local parts = {}
-    for dummy, mod in ipairs(MOD_ORDER) do -- luacheck: ignore dummy
-        if key[mod] then table.insert(parts, mod) end
-    end
-    table.insert(parts, key.key)
-    return table.concat(parts, "+")
-end
-
-local function idToSequence(id)
-    local seq = {}
-    for part in id:gmatch("[^+]+") do table.insert(seq, part) end
-    return seq
-end
-
--- Shared across the FileManager and ReaderUI plugin instances.
-local keymap_path = ffiutil.joinPath(DataStorage:getSettingsDir(),
-    "hidpassthrough_keymap.lua")
-local keymap_settings
-
-local function getKeymapSettings()
-    if not keymap_settings then
-        keymap_settings = LuaSettings:open(keymap_path)
-    end
-    return keymap_settings
-end
-
 -- Declared above _attachInput, which fills it.
 local input_fds = {}
 
@@ -251,10 +195,16 @@ end
 
 function HIDPassthrough:_attachInput(path, force)
     if input_fds[path] and not force then return end
-    if Device.input.opened_devices[path] and not input_fds[path] then return end
+    if Device.input.opened_devices[path] and not input_fds[path] then
+        logger.dbg("HIDPassthrough: leaving", path, "to KOReader")
+        return
+    end
 
     local info = checkKeyDevice(path)
-    if not info then return end
+    if not info then
+        logger.dbg("HIDPassthrough: cannot open", path, "as a key device")
+        return
+    end
 
     -- uhid recreates the node on reconnect; a stale fd makes the input poll
     -- fail with ENODEV and then nothing reaches any plugin.
@@ -265,9 +215,25 @@ function HIDPassthrough:_attachInput(path, force)
 
     input_fds[info.path] = Device.input:fdopen(info.fd, info.path, info.name)
     logger.info("HIDPassthrough: attached input", info.name, "@", info.path)
-    -- Bindings may have been registered before the device showed up.
     self:_extendEventMap()
-    self:registerKeyEvents()
+end
+
+-- Take a node back that we handed to the mapper. checkKeyDevice deliberately
+-- skips keyboards, since externalkeyboard owns those, but it has no idea we
+-- closed this one behind its back and will not re-adopt without a reconnect.
+-- So open it here regardless of type rather than leave the device dead.
+function HIDPassthrough:_reclaimInput(path)
+    local FBInkInput = ffi.loadlib("fbink_input", 1)
+    local dev = FBInkInput.fbink_input_check(path, C.INPUT_KEY, 0, 0)
+    if dev == nil then return false end
+    local matched, fd, name = dev.matched, tonumber(dev.fd), ffi.string(dev.name)
+    local real = ffi.string(dev.path)
+    C.free(dev)
+    if not matched then return false end
+    input_fds[real] = Device.input:fdopen(fd, real, name)
+    logger.info("HIDPassthrough: took", real, "back from Button Mapper")
+    self:_extendEventMap()
+    return true
 end
 
 function HIDPassthrough:_detachInput(path)
@@ -366,208 +332,496 @@ function HIDPassthrough:onEvdevInputRemove(path)
     UIManager:scheduleIn(1, function() self:_detachInput(path) end)
 end
 
-function HIDPassthrough:registerKeyEvents()
-    self.key_events = {}
-    local keymap = getKeymapSettings().data
-    -- Register every id, even unassigned: the action is resolved at press
-    -- time, so edits take effect without re-registering.
-    for id in pairs(keymap) do
-        self.key_events["HIDPassthroughKey_" .. id] = {
-            idToSequence(id),
-            event = "HIDPassthroughKeyAction",
-            args = id,
-        }
+------------------------------------------------------------------------------
+-- Button Mapper frontend
+------------------------------------------------------------------------------
+-- Gamepads and remotes are the mapper's job (it grabs them and emits plain
+-- keys), so their mappings are edited in its config over its helper API
+-- rather than in KOReader's event path.
+
+function HIDPassthrough:_mapper()
+    if not self._mapper_client then
+        self._mapper_client = dofile(self.path .. "/mapper.lua")
     end
-    logger.dbg("HIDPassthrough: registered",
-        util.tableSize(self.key_events), "key bindings")
+    return self._mapper_client
 end
 
-function HIDPassthrough:onPhysicalKeyboardConnected()
-    self:_extendEventMap()
-    self:registerKeyEvents()
-end
-
--- Overrides InputContainer's handler, which drops key_events outright.
-function HIDPassthrough:onPhysicalKeyboardDisconnected()
-    self:_extendEventMap()
-    if Device:hasKeys() or next(input_fds) ~= nil then
-        self:registerKeyEvents()
-    else
-        self.key_events = {}
+function HIDPassthrough:genMapperMenu()
+    local mapper = self:_mapper()
+    if not mapper.installed() then
+        return {{ text = _("Button Mapper is not installed"), enabled = false }}
     end
+    local ok, err = mapper.ensureHelper()
+    if not ok then
+        return {{ text = T(_("Button Mapper unreachable: %1"), tostring(err)), enabled = false }}
+    end
+    local text = mapper.getConfig()
+    if not text then
+        return {{ text = _("Could not read the Button Mapper config"), enabled = false }}
+    end
+
+    local items = {}
+    for dummy, dev in ipairs(mapper.deviceBlocks(text)) do -- luacheck: ignore dummy
+        table.insert(items, {
+            text = dev.name or dev.id,
+            sub_item_table_func = function() return self:genMapperDeviceMenu(dev) end,
+        })
+    end
+    if #items == 0 then
+        table.insert(items, {
+            text = _("No devices registered yet. Pair one first."),
+            enabled = false,
+        })
+    end
+    return items
 end
 
-function HIDPassthrough:onHIDPassthroughKeyAction(id)
-    local actions = getKeymapSettings().data[id]
-    if type(actions) ~= "table" or next(actions) == nil then return end
-    logger.dbg("HIDPassthrough: executing binding for", id)
-    Dispatcher:execute(actions)
-    return true
-end
-
--- Overriding onKeyPress bypasses key_events matching, so unbound keys are
--- visible here.
-local KeyCapture = InfoMessage:extend{
-    on_key_captured = nil,
+local MAPPER_KINDS = {
+    { section = "buttons",  label = _("Button") },
+    { section = "dpad",     label = _("D-pad") },
+    { section = "triggers", label = _("Trigger") },
 }
 
-function KeyCapture:onKeyPress(key)
-    if MODIFIER_KEYS[key.key] then return true end
-    -- Serialize before closing.
-    local id = keyToId(key)
-    local callback = self.on_key_captured
-    UIManager:close(self)
-    if callback then callback(id) end
-    return true
+-- Who owns the device node. Only one process can hold an evdev grab, so this
+-- is the difference between KOReader seeing the keys and the mapper seeing
+-- them. `grab` absent means the daemon decides from the node itself.
+local MAPPER_MODES = {
+    {
+        title = _("Automatic"),
+        note = _("Gamepads are taken over, keyboards are left to KOReader."),
+        grab = nil, passthrough = nil,
+    },
+    {
+        title = _("KOReader only"),
+        note = _("Button Mapper leaves this device alone. Mappings won't fire."),
+        grab = "false", passthrough = nil,
+    },
+    {
+        title = _("Button Mapper, keys still type"),
+        note = _("Mapped buttons run their action, everything else is passed through untouched."),
+        grab = "true", passthrough = "true",
+    },
+    {
+        title = _("Button Mapper, exclusive"),
+        note = _("Mapped buttons run their action, everything else does nothing."),
+        grab = "true", passthrough = "false",
+    },
+}
+
+function HIDPassthrough:_mapperMode(dev)
+    local text = self:_mapper().getConfig() or ""
+    local section = "device." .. dev.id
+    local grab = self:_mapper().sectionValue(text, section, "grab")
+    local passthrough = self:_mapper().sectionValue(text, section, "passthrough")
+    for dummy, mode in ipairs(MAPPER_MODES) do -- luacheck: ignore dummy
+        if mode.grab == grab and (mode.grab ~= "true" or mode.passthrough == passthrough) then
+            return mode
+        end
+    end
+    return MAPPER_MODES[1]
 end
 
-function HIDPassthrough:captureKey(callback)
-    UIManager:show(KeyCapture:new{
-        text = _("Press the key you want to map.\n\nTap the screen to cancel."),
-        on_key_captured = callback,
-    })
+-- Only one process can hold an evdev grab, and KOReader takes one on every
+-- node it opens. So the mapper cannot claim a keyboard while KOReader has it,
+-- and the mode the user picked has to be matched by actually letting go.
+local function releaseNode(path)
+    input_fds[path] = nil
+    local ok, err = pcall(Device.input.close, Device.input, path)
+    if ok then
+        logger.info("HIDPassthrough: released", path, "for Button Mapper")
+    else
+        logger.dbg("HIDPassthrough: nothing to release at", path, err)
+    end
 end
 
-function HIDPassthrough:genKeymapMenu()
-    local keymap = getKeymapSettings().data
+function HIDPassthrough:_applyMapperMode(dev, mode)
+    local node = self:_mapper().findNode(dev.uniq or "")
+    -- Hand the node over before the daemon is told to take it, and take it
+    -- back only after the daemon has been told to let go.
+    if node and mode.grab == "true" then
+        releaseNode(node)
+    end
+
+    local ok = self:mapperEdit(function(cur)
+        local section = "device." .. dev.id
+        for dummy, key in ipairs({ "grab", "passthrough" }) do -- luacheck: ignore dummy
+            if mode[key] then
+                cur = self:_mapper().setKey(cur, section, key, mode[key])
+            else
+                cur = self:_mapper().removeKey(cur, section, key)
+            end
+        end
+        return cur
+    end)
+
+    if node and ok and mode.grab ~= "true" then
+        -- The daemon ungrabs on its own reload tick, so give it a moment
+        -- before reopening or this grab lands while it still holds one.
+        -- Drop whatever KOReader still thinks it has first: handing the node
+        -- over leaves a stale entry that would make the reopen a no-op, and
+        -- then the device would be dead here until KOReader restarts.
+        UIManager:scheduleIn(1.5, function()
+            releaseNode(node)
+            if not self:_reclaimInput(node) then
+                logger.warn("HIDPassthrough: could not take", node, "back from Button Mapper")
+                UIManager:show(InfoMessage:new{
+                    text = _("Reconnect the device for KOReader to pick it up again."),
+                    timeout = 4,
+                })
+            end
+        end)
+    end
+    return ok
+end
+
+function HIDPassthrough:genMapperModeMenu(dev)
+    local items = {}
+    for dummy, mode in ipairs(MAPPER_MODES) do -- luacheck: ignore dummy
+        table.insert(items, {
+            text = mode.title,
+            help_text = mode.note,
+            radio = true,
+            checked_func = function() return self:_mapperMode(dev).title == mode.title end,
+            callback = function(touchmenu_instance)
+                self:_applyMapperMode(dev, mode)
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        })
+    end
+    return items
+end
+
+function HIDPassthrough:genMapperDeviceMenu(dev)
+    local mapper = self:_mapper()
     local items = {
         {
-            text = _("Add a key…"),
+            text_func = function()
+                return T(_("Handled by: %1"), self:_mapperMode(dev).title)
+            end,
+            sub_item_table_func = function() return self:genMapperModeMenu(dev) end,
+        },
+        {
+            text = _("Map a button…"),
             keep_menu_open = true,
             callback = function(touchmenu_instance)
-                self:captureKey(function(id)
-                    if keymap[id] == nil then
-                        keymap[id] = {}
-                        self.updated = true
-                        self:registerKeyEvents()
-                    end
-                    -- updateItems() re-renders the cached item_table and
-                    -- doesn't re-run sub_item_table_func.
-                    if touchmenu_instance then
-                        touchmenu_instance.item_table = self:genKeymapMenu()
-                        touchmenu_instance:updateItems()
-                    end
-                    UIManager:show(InfoMessage:new{
-                        text = T(_("Bound %1. Pick an action for it below."), id),
-                        timeout = 3,
-                    })
-                end)
+                self:mapperCapture(dev, touchmenu_instance,
+                    #touchmenu_instance.item_table_stack)
             end,
             separator = true,
         },
     }
 
-    local ids = {}
-    for id in pairs(keymap) do table.insert(ids, id) end
-    table.sort(ids)
+    local text = mapper.getConfig() or ""
+    for dummy, kind in ipairs(MAPPER_KINDS) do -- luacheck: ignore dummy
+        local section = "device." .. dev.id .. "." .. kind.section
+        for dummy2, entry in ipairs(mapper.sectionKeys(text, section)) do -- luacheck: ignore dummy2
+            local action = mapper.describeScript(entry.value, self:_actionTitles())
+            local label = T("%1 %2", kind.label, entry.key)
+            table.insert(items, {
+                text = T("%1  →  %2", label, action),
+                keep_menu_open = true,
+                sub_item_table_func = function()
+                    return self:genMappingMenu(dev, section, entry.key, label)
+                end,
+                ignored_by_menu_search = true,
+            })
+        end
+    end
 
-    -- Not `for _, id`: that shadows the gettext `_` in these closures.
-    for dummy, id in ipairs(ids) do -- luacheck: ignore dummy
+    -- The mode entry and "Map a button…" are always there, so anything past
+    -- them is a real mapping. Only a gamepad gets a layout for free, the
+    -- mapper leaves anything else alone until something here names a button,
+    -- so don't promise defaults that a keyboard will never have.
+    if #items == 2 then
         table.insert(items, {
-            text_func = function()
-                local actions = keymap[id]
-                local label = (actions and next(actions) ~= nil)
-                    and Dispatcher:menuTextFunc(actions)
-                    or _("No action")
-                return T("%1  →  %2", id, label)
+            text = _("(nothing mapped — gamepads get defaults)"),
+            enabled = false,
+        })
+    end
+    items.refresh_func = function() return self:genMapperDeviceMenu(dev) end
+    return items
+end
+
+-- What one already-mapped control offers. A submenu rather than a hold, so
+-- removing is discoverable and TouchMenu's own back arrow gets you out.
+function HIDPassthrough:genMappingMenu(dev, section, key, label)
+    local mapper = self:_mapper()
+    return {
+        {
+            text = _("Change action…"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                -- This submenu sits one level below the device list.
+                self:pushActionPicker(dev, section, key, label,
+                    #touchmenu_instance.item_table_stack - 1, touchmenu_instance)
             end,
-            -- On demand: each is the full Dispatcher tree.
-            sub_item_table_func = function() return self:genKeyActionMenu(id) end,
-            -- Also at the bottom of the action tree, but that's two pages in.
-            hold_callback = function(touchmenu_instance)
+        },
+        {
+            text = _("Remove this mapping"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
                 UIManager:show(ConfirmBox:new{
-                    text = T(_("Remove the mapping for %1?"), id),
+                    text = T(_("Remove the mapping for %1?"), label),
                     ok_text = _("Remove"),
                     ok_callback = function()
-                        self:removeKey(id)
+                        self:mapperEdit(function(cur)
+                            return mapper.removeKey(cur, section, key)
+                        end)
                         if touchmenu_instance then
-                            touchmenu_instance.item_table = self:genKeymapMenu()
-                            touchmenu_instance:updateItems()
+                            -- Mark the parent stale so its refresh_func rebuilds.
+                            local stack = touchmenu_instance.item_table_stack
+                            local parent = stack and stack[#stack]
+                            if parent then parent.needs_refresh = true end
+                            touchmenu_instance:backToUpperMenu()
                         end
                     end,
                 })
             end,
-            ignored_by_menu_search = true,
-        })
-    end
-
-    if #ids == 0 then
-        table.insert(items, {
-            text = _("(no keys mapped yet)"),
-            enabled = false,
-        })
-    end
-
-    -- Used by TouchMenu:backToUpperMenu when a child marks us stale.
-    items.refresh_func = function() return self:genKeymapMenu() end
-    return items
+        },
+    }
 end
 
-function HIDPassthrough:removeKey(id)
-    getKeymapSettings().data[id] = nil
-    self.updated = true
-    self:registerKeyEvents()
+-- Re-fetch, transform, write back, reload. The helper serializes writers, but
+-- editing a stale text would still drop someone else's change, so keep the
+-- window small by fetching right before the edit.
+function HIDPassthrough:mapperEdit(transform)
+    local mapper = self:_mapper()
+    local text = mapper.getConfig()
+    if not text then
+        UIManager:show(InfoMessage:new{ text = _("Could not read the Button Mapper config.") })
+        return false
+    end
+    local ok, err = mapper.setConfig(transform(text))
+    if not ok then
+        UIManager:show(InfoMessage:new{ text = T(_("Saving failed: %1"), tostring(err)) })
+        return false
+    end
+    mapper.reload()
+    return true
 end
 
-function HIDPassthrough:genKeyActionMenu(id)
-    local keymap = getKeymapSettings().data
-    local sub_items = {}
+function HIDPassthrough:mapperCapture(dev, touchmenu_instance, device_depth)
+    local mapper = self:_mapper()
+    local node = mapper.findNode(dev.uniq or "")
+    if not node then
+        UIManager:show(InfoMessage:new{
+            text = T(_("%1 is not connected."), dev.name or dev.id),
+        })
+        return
+    end
 
-    local unknown = _("Unknown item")
-    for dummy, action in ipairs(COMMON_ACTIONS) do -- luacheck: ignore dummy
-        local title = Dispatcher:getNameFromItem(action, nil, true)
-        if title ~= unknown then
-            table.insert(sub_items, {
-                text = title,
-                checked_func = function()
-                    return keymap[id] ~= nil and keymap[id][action] ~= nil
-                end,
-                callback = function(touchmenu_instance)
-                    if keymap[id] == nil then keymap[id] = {} end
-                    if keymap[id][action] == nil then
-                        keymap[id][action] = true
-                        Dispatcher._addToOrder(keymap, id, action)
-                    else
-                        keymap[id][action] = nil
-                        Dispatcher._removeFromOrder(keymap, id, action)
-                    end
-                    self.updated = true
-                    if touchmenu_instance then
-                        touchmenu_instance:updateItems()
-                    end
-                end,
+    local msg = InfoMessage:new{
+        text = _("Press a button or D-pad direction on the controller…"),
+    }
+    UIManager:show(msg)
+    -- Painted first; the capture request then blocks the UI until a press
+    -- or the helper's timeout. Whatever the menu was showing then is what
+    -- the picker has to be pushed onto, so remember it and check on the way
+    -- back rather than pushing onto whatever the user browsed to meanwhile.
+    local menu_at_start = touchmenu_instance and touchmenu_instance.item_table
+    UIManager:scheduleIn(0.1, function()
+        local cap, err = mapper.capture(node, 8000)
+        UIManager:close(msg)
+        if not cap then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Nothing captured: %1"), tostring(err or "timeout")),
+                timeout = 3,
             })
+            return
         end
-    end
-    if #sub_items > 0 then
-        sub_items[#sub_items].separator = true
-    end
-
-    Dispatcher:addSubMenu(self, sub_items, keymap, id)
-    table.insert(sub_items, {
-        text = _("Remove this key"),
-        -- Or TouchMenu closes the menu after the callback, undoing our
-        -- backToUpperMenu.
-        keep_menu_open = true,
-        callback = function(touchmenu_instance)
-            self:removeKey(id)
-            if touchmenu_instance then
-                -- Mark stale so backToUpperMenu rebuilds via refresh_func.
-                local stack = touchmenu_instance.item_table_stack
-                local parent = stack and stack[#stack]
-                if parent then parent.needs_refresh = true end
-                touchmenu_instance:backToUpperMenu()
-            end
-        end,
-    })
-    return sub_items
+        local section, key, label = mapper.captureTarget(dev.id, cap)
+        if not section then
+            UIManager:show(InfoMessage:new{
+                text = _("That input isn't mappable here."),
+                timeout = 3,
+            })
+            return
+        end
+        if not touchmenu_instance then return end
+        if touchmenu_instance.item_table ~= menu_at_start then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Captured %1. Open it from the list to pick an action."), label),
+                timeout = 3,
+            })
+            return
+        end
+        self:pushActionPicker(dev, section, key, label, device_depth, touchmenu_instance)
+    end)
 end
 
-function HIDPassthrough:onFlushSettings()
-    if self.updated then
-        getKeymapSettings():flush()
-        self.updated = false
+-- Event name to title, for labelling mappings already in the config.
+-- Every script the picker can write, mapped back to the wording it was picked
+-- under, so an already-configured mapping reads as "Toggle night mode" rather
+-- than "koreader.sh night_mode". Keyed by script line and, for KOReader events,
+-- by bare event name too, since those can also arrive from the mapper's own app.
+function HIDPassthrough:_actionTitles()
+    if not self._action_titles then
+        local titles = {}
+        for dummy, group in ipairs(self:_actionSections()) do -- luacheck: ignore dummy
+            for dummy2, item in ipairs(group.items) do -- luacheck: ignore dummy2
+                titles[item.script] = item.title
+                local event = item.script:match("koreader%.sh event ([%w_]+)$")
+                if event then titles[event] = item.title end
+            end
+        end
+        self._action_titles = titles
     end
+    return self._action_titles
+end
+
+-- KOReader's own actions, plus the mapper's native ones for the cases KOReader
+-- cannot do (native reader page turns, screen taps, brightness over lipc).
+-- What people actually bind, in the order they reach for it. The auto.* ones
+-- try KOReader first and fall back to the native reader, so a favourite keeps
+-- working outside KOReader, which the KOReader event list cannot do.
+local FAVORITE_ACTIONS = {
+    { kind = "auto",     id = "next_page" },
+    { kind = "auto",     id = "prev_page" },
+    { kind = "auto",     id = "menu" },
+    { kind = "koreader", id = "night_mode" },
+    { kind = "auto",     id = "brightness 1" },
+    { kind = "auto",     id = "brightness -1" },
+    { kind = "auto",     id = "brightness_toggle" },
+    { kind = "koreader", id = "font_up 1" },
+    { kind = "koreader", id = "font_down 1" },
+    { kind = "koreader", id = "toggle_status_bar" },
+    { kind = "koreader", id = "rotate" },
+}
+
+function HIDPassthrough:_actionSections()
+    if not self._action_sections then
+        local sections = {}
+        local native = self:_mapper().actions()
+
+        if native then
+            local by_key = {}
+            for dummy, a in ipairs(native) do -- luacheck: ignore dummy
+                by_key[a.kind .. "\0" .. a.id] = a
+            end
+            local items = {}
+            for dummy, fav in ipairs(FAVORITE_ACTIONS) do -- luacheck: ignore dummy
+                local a = by_key[fav.kind .. "\0" .. fav.id]
+                if a then
+                    table.insert(items, {
+                        title = a.label,
+                        script = self:_mapper().actionScript(a),
+                    })
+                end
+            end
+            if #items > 0 then
+                table.insert(sections, { title = _("Favorites"), items = items })
+            end
+        end
+
+        local ok, koactions = pcall(dofile,
+            ffiutil.joinPath(self.path, "koreader_actions.lua"))
+        if ok and type(koactions) == "table" then
+            for dummy, group in ipairs(koactions) do -- luacheck: ignore dummy
+                local items = {}
+                for dummy2, a in ipairs(group.actions) do -- luacheck: ignore dummy2
+                    table.insert(items, {
+                        title = a.title,
+                        script = self:_mapper().koreaderEventScript(a.event),
+                    })
+                end
+                table.insert(sections, { title = group.section, items = items })
+            end
+        else
+            logger.warn("HIDPassthrough: could not load koreader_actions:", koactions)
+        end
+
+        -- Split by what the script actually drives rather than lumping both
+        -- under one "native" heading: auto.* try KOReader first and fall back
+        -- to the Kindle reader, kindle.* only ever drive the Kindle reader.
+        -- The koreader.* ones duplicate the KOReader list above.
+        local NATIVE_GROUPS = {
+            { kind = "auto",   title = _("Works outside KOReader too") },
+            { kind = "kindle", title = _("Native Kindle reader") },
+        }
+        if native then
+            for dummy, group in ipairs(NATIVE_GROUPS) do -- luacheck: ignore dummy
+                local items = {}
+                for dummy2, a in ipairs(native) do -- luacheck: ignore dummy2
+                    if a.kind == group.kind then
+                        table.insert(items, {
+                            title = a.label,
+                            script = self:_mapper().actionScript(a),
+                        })
+                    end
+                end
+                if #items > 0 then
+                    table.insert(sections, { title = group.title, items = items })
+                end
+            end
+        end
+        self._action_sections = sections
+    end
+    return self._action_sections
+end
+
+-- The action picker lives inside the TouchMenu we were called from rather
+-- than in a Menu of its own. A second full-screen widget layered over the
+-- TouchMenu fought it for input, which is why finishing any of these flows
+-- dumped you back at the top menu.
+--
+-- device_depth is the stack length at which item_table is the device list, so
+-- assigning can unwind straight back to it.
+function HIDPassthrough:pushActionPicker(dev, section, key, label, device_depth, touchmenu)
+    local sections = self:_actionSections()
+    if #sections == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No actions available.") })
+        return
+    end
+
+    local items = {}
+    for dummy, group in ipairs(sections) do -- luacheck: ignore dummy
+        table.insert(items, {
+            text = T("%1  (%2)", group.title, tostring(#group.items)),
+            sub_item_table_func = function()
+                local sub = {}
+                for dummy2, action in ipairs(group.items) do -- luacheck: ignore dummy2
+                    table.insert(sub, {
+                        text = action.title,
+                        keep_menu_open = true,
+                        callback = function(inner)
+                            self:mapperAssign(dev, section, key, label, action,
+                                device_depth, inner)
+                        end,
+                    })
+                end
+                return sub
+            end,
+        })
+    end
+
+    -- Same two steps onMenuSelect takes for a sub_item_table, so the back
+    -- arrow and paging behave exactly as they do everywhere else.
+    table.insert(touchmenu.item_table_stack, touchmenu.item_table)
+    touchmenu.item_table = items
+    touchmenu:updateItems(1)
+end
+
+function HIDPassthrough:mapperAssign(dev, section, key, label, action, device_depth, touchmenu)
+    local mapper = self:_mapper()
+    if not self:mapperEdit(function(cur)
+        return mapper.setKey(cur, section, key, action.script)
+    end) then
+        return
+    end
+
+    if touchmenu then
+        -- Unwind to the device list, then rebuild it so the new mapping shows
+        -- and the next button is one tap away.
+        while #touchmenu.item_table_stack > device_depth do
+            touchmenu.item_table = table.remove(touchmenu.item_table_stack)
+        end
+        touchmenu.item_table = self:genMapperDeviceMenu(dev)
+        touchmenu:updateItems(1)
+    end
+    UIManager:show(InfoMessage:new{
+        text = T(_("Mapped %1 to %2."), label, action.title),
+        timeout = 2,
+    })
 end
 
 ------------------------------------------------------------------------------
@@ -742,6 +996,24 @@ function HIDPassthrough:showInfo()
         end
         if body:find('"pairing"%s*:%s*true') then
             table.insert(lines, _("Currently pairing…"))
+        end
+    end
+
+    -- The mapper is the other half of this plugin now, so a status panel that
+    -- only covers the Bluetooth side answers half the question.
+    table.insert(lines, "")
+    local mapper = self:_mapper()
+    if not mapper.installed() then
+        table.insert(lines, _("Button Mapper: not installed"))
+    else
+        local status = mapper.status()
+        if not status then
+            table.insert(lines, _("Button Mapper: helper not reachable"))
+        else
+            local running = status.running and _("running") or _("stopped")
+            local version = status.version or "?"
+            if status.build then version = version .. "-" .. status.build end
+            table.insert(lines, T(_("Button Mapper: %1 (%2)"), running, version))
         end
     end
 
@@ -1004,6 +1276,52 @@ function HIDPassthrough:showPairedDevices()
     UIManager:show(menu)
 end
 
+-- The Bluetooth list and the mapper's device list are keyed differently, one
+-- by pairing address and one by config block, so match on the bare MAC.
+function HIDPassthrough:_mapperDeviceFor(addr)
+    local mapper = self:_mapper()
+    if not mapper.installed() then return nil end
+    local text = mapper.getConfig()
+    if not text then return nil end
+    local want = mapper.bareAddr(addr)
+    for dummy, dev in ipairs(mapper.deviceBlocks(text)) do -- luacheck: ignore dummy
+        if dev.uniq and mapper.bareAddr(dev.uniq) == want then return dev end
+    end
+end
+
+function HIDPassthrough:_showMapperModePicker(mdev, addr, proto, name, is_connected)
+    local items = {}
+    for dummy, mode in ipairs(MAPPER_MODES) do -- luacheck: ignore dummy
+        local current = self:_mapperMode(mdev).title == mode.title
+        table.insert(items, {
+            text = (current and "● " or "○ ") .. mode.title,
+            callback = function()
+                UIManager:close(self._mode_menu)
+                self._mode_menu = nil
+                self:_applyMapperMode(mdev, mode)
+                self:_showDeviceActions(addr, proto, name, is_connected)
+            end,
+        })
+    end
+
+    local menu
+    menu = Menu:new{
+        title = mdev.name or mdev.id,
+        subtitle = _("Who reads this device"),
+        item_table = items,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        is_popout = false,
+        onClose = function()
+            UIManager:close(menu)
+            self._mode_menu = nil
+            self:_showDeviceActions(addr, proto, name, is_connected)
+        end,
+    }
+    self._mode_menu = menu
+    UIManager:show(menu)
+end
+
 function HIDPassthrough:_showDeviceActions(addr, proto, name, is_connected)
     local label = (name and name ~= "" and name) or addr
     local items = {}
@@ -1026,6 +1344,20 @@ function HIDPassthrough:_showDeviceActions(addr, proto, name, is_connected)
             end,
         })
     end
+    -- Same setting as the one under Key mappings, written through the same
+    -- code. This is where people look for it, so offer it here too.
+    local mdev = self:_mapperDeviceFor(addr)
+    if mdev then
+        table.insert(items, {
+            text = T(_("Handled by: %1"), self:_mapperMode(mdev).title),
+            callback = function()
+                UIManager:close(self._action_menu)
+                self._action_menu = nil
+                self:_showMapperModePicker(mdev, addr, proto, name, is_connected)
+            end,
+        })
+    end
+
     table.insert(items, {
         text = _("Remove (forget)"),
         callback = function()
@@ -1310,7 +1642,6 @@ function HIDPassthrough:init()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
     self:_extendEventMap()
-    self:registerKeyEvents()
     -- Or no binding fires while a menu covers us. Same trick as Screenshoter.
     if self.ui.active_widgets then
         table.insert(self.ui.active_widgets, self)
@@ -1372,7 +1703,7 @@ function HIDPassthrough:addToMainMenu(menu_items)
             {
                 text = _("Key mappings"),
                 keep_menu_open = true,
-                sub_item_table_func = function() return self:genKeymapMenu() end,
+                sub_item_table_func = function() return self:genMapperMenu() end,
                 separator = true,
             },
             {
@@ -1407,16 +1738,23 @@ function HIDPassthrough:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 callback = function()
                     UIManager:show(InfoMessage:new{
-                        text = T(_([[Manages the kindle-hid-passthrough Bluetooth HID daemon.
+                        text = T(_([[Pairing runs on the kindle-hid-passthrough Bluetooth HID daemon,
+key mappings run on kindle-button-mapper. Both must already be installed.
 
-Binary: %1
-API:    http://%2:%3
+HID daemon: %1
+API:        http://%2:%3
 
-The daemon must already be installed on the device. See:
-https://github.com/zampierilucas/kindle-hid-passthrough]]),
+Button Mapper: %4
+API:           http://%5:%6
+
+https://github.com/zampierilucas/kindle-hid-passthrough
+https://github.com/zampierilucas/kindle-button-mapper-rs]]),
                             self.DAEMON_BINARY,
                             self.API_HOST,
-                            tostring(self.API_PORT)),
+                            tostring(self.API_PORT),
+                            self:_mapper().BIN,
+                            self:_mapper().HOST,
+                            tostring(self:_mapper().PORT)),
                     })
                 end,
             },

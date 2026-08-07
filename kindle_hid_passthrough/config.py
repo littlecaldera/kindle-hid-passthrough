@@ -303,6 +303,10 @@ class Config:
             with open(conf_file, 'w') as f:
                 f.writelines(lines_to_keep)
             keys_removed = self.remove_pairing_key(address)
+            # Otherwise the block outlives the pairing and the device keeps
+            # showing up under the plugin's mapping menu forever.
+            import button_mapper
+            button_mapper.unregister_device(address)
 
         return {"removed": removed, "keys_removed": keys_removed}
 
@@ -341,6 +345,8 @@ class Config:
                 else:
                     f.write(f"{addr_norm} {protocol.value}\n")
             logger.info(f"Added: {addr_norm} {protocol.value} ({name or 'unnamed'})")
+            import button_mapper
+            button_mapper.register_device(addr_norm, name)
         except Exception as e:
             logger.error(f"Failed to save device: {e}")
 

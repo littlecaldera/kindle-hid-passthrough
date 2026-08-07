@@ -1,6 +1,7 @@
 #!/bin/sh
 
 INSTALL_DIR="/mnt/us/kindle_hid_passthrough"
+MAPPER_DIR="/mnt/us/kindle-button-mapper"
 APP_ID="com.lzampier.btmanager"
 APPREG_DB="/var/local/appreg.db"
 SCRIPTLET_DEST="/mnt/us/documents/BTManager.sh"
@@ -153,6 +154,7 @@ installAll()
     installUpstart
   fi
   installWAFApp
+  installButtonMapper
   if ! installKOReaderPlugin; then
     startDaemon
     echo ""
@@ -223,6 +225,26 @@ installWAFApp()
   fi
 }
 
+# Installs into its own directory with its own upstart job, so an existing
+# standalone install is updated rather than duplicated, and it keeps working if
+# this one is removed. Its install.sh runs under `set -e` and ends by poking
+# upstart, which fails on a Kindle that never had the job, so a non-zero exit
+# here is a warning and not a failed install.
+installButtonMapper()
+{
+  if [ ! -f "$SRC_DIR/button-mapper/install.sh" ]; then
+    echo " -> Button Mapper not bundled in this build, skipping"
+    return 0
+  fi
+  echo " -> Installing Button Mapper"
+  if /bin/sh "$SRC_DIR/button-mapper/install.sh"; then
+    echo " -> Ready."
+  else
+    echo " -> WARNING: Button Mapper install failed, gamepad mapping will be unavailable"
+  fi
+  return 0
+}
+
 installKOReaderPlugin()
 {
   PLUGINS_DIR=$(koreaderPluginDir) || {
@@ -244,7 +266,7 @@ installKOReaderPlugin()
     return 1
   fi
 
-  for f in main.lua _meta.lua event_map_extra.lua; do
+  for f in main.lua _meta.lua event_map_extra.lua mapper.lua koreader_actions.lua; do
     if [ ! -f "$DEST/$f" ]; then
       echo "ERROR: $f is missing from $DEST" >&2
       return 1
@@ -257,7 +279,7 @@ uninstallAll()
 {
   echo ""
   echo "=== Uninstall ==="
-  printf "This will stop the daemon, remove udev/upstart/WAF app, and delete the install directory.\n"
+  printf "This will stop the daemon, remove udev/upstart/WAF app, Button Mapper, and delete the install directory.\n"
   # Only prompt when there is someone to answer. Package managers run this
   # without a tty and have already asked in their own UI.
   if [ -t 0 ]; then
@@ -296,6 +318,8 @@ EOF
 
   /usr/sbin/mntroot ro
 
+  uninstallButtonMapper
+
   if PLUGINS_DIR=$(koreaderPluginDir); then
     echo " -> Removing KOReader plugin"
     rm -rf "$PLUGINS_DIR/hidpassthrough.koplugin"
@@ -309,6 +333,23 @@ EOF
   echo "Uninstall complete. Reboot recommended."
 }
 
+# Button Mapper is the mapping backend now, not an optional extra, so it goes
+# with everything else. Its own uninstaller owns the upstart job, the WAF app
+# and the install dir, so defer to it rather than duplicating any of that.
+uninstallButtonMapper()
+{
+  if [ ! -f "$MAPPER_DIR/uninstall.sh" ]; then
+    return 0
+  fi
+  echo " -> Removing Button Mapper"
+  if /bin/sh "$MAPPER_DIR/uninstall.sh" >/dev/null 2>&1; then
+    echo " -> Ready."
+  else
+    echo " -> WARNING: Button Mapper uninstall failed, remove $MAPPER_DIR by hand"
+  fi
+  return 0
+}
+
 print_menu()
 {
   printf "\nSelect an option:\n"
@@ -319,9 +360,10 @@ print_menu()
   printf " 5) Install upstart (auto-start on boot)\n"
   printf " 6) Install BTManager app\n"
   printf " 7) Install KOReader plugin\n"
-  printf " 8) Uninstall everything\n"
-  printf " 9) Disable auto-start on boot (remove upstart)\n"
-  printf "10) Quit\n"
+  printf " 8) Install Button Mapper (gamepad mapping)\n"
+  printf " 9) Uninstall everything\n"
+  printf "10) Disable auto-start on boot (remove upstart)\n"
+  printf "11) Quit\n"
 }
 
 # Non-interactive entry point: `sh install.sh <action>` runs one action and exits.
@@ -334,6 +376,8 @@ if [ $# -gt 0 ]; then
     installMainFiles)   installMainFiles; exit $? ;;
     installWAFApp)      installWAFApp; exit $? ;;
     installKOReaderPlugin) installKOReaderPlugin; exit $? ;;
+    installButtonMapper) installButtonMapper; exit $? ;;
+    uninstallButtonMapper) uninstallButtonMapper; exit $? ;;
     uninstallAll)       uninstallAll; exit $? ;;
     *) echo "Unknown action: $1" >&2; exit 1 ;;
   esac
@@ -341,7 +385,7 @@ fi
 
 while :; do
   print_menu
-  printf "Enter choice [1-10]: "
+  printf "Enter choice [1-11]: "
   read choice
   case "$choice" in
     1)
@@ -366,12 +410,15 @@ while :; do
       installKOReaderPlugin
       ;;
     8)
-      uninstallAll
+      installButtonMapper
       ;;
     9)
-      removeUpstart
+      uninstallAll
       ;;
     10)
+      removeUpstart
+      ;;
+    11)
       echo "Exiting."
       break
       ;;
