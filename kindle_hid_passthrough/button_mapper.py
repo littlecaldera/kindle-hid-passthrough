@@ -12,7 +12,7 @@ own app, a parser round-trip would eat comments and formatting.
 import logging
 import os
 import re
-import subprocess
+import signal
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def _slug(name: str, address: str, text: str) -> str:
     return slug
 
 
-def register_device(address: str, name: str = None, restart: bool = True) -> bool:
+def register_device(address: str, name: str = None, reload: bool = True) -> bool:
     """Add a device block to the mapper config. True if one was added."""
     try:
         with open(MAPPER_CONFIG) as f:
@@ -71,9 +71,72 @@ def register_device(address: str, name: str = None, restart: bool = True) -> boo
         return False
 
     logger.info(f"Registered {address} as [device.{slug}] with button-mapper")
-    if restart:
-        _restart_mapper()
+    if reload:
+        _reload_mapper()
     return True
+
+
+def unregister_device(address: str) -> bool:
+    """Drop the [device.X] blocks whose uniq matches. True if any went."""
+    try:
+        with open(MAPPER_CONFIG) as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+
+    address = _bare_addr(address)
+    kept, dropped = [], False
+    # Blocks run to the next [section] at the same level, and a device's
+    # [device.X.buttons] children have to go with it.
+    drop_prefix = None
+    for block_id, block in _blocks(lines):
+        if drop_prefix and block_id and (
+                block_id == drop_prefix or block_id.startswith(drop_prefix + '.')):
+            dropped = True
+            continue
+        drop_prefix = None
+        if block_id and '.' not in block_id and _block_uniq(block) == address:
+            drop_prefix = block_id
+            dropped = True
+            continue
+        kept.extend(block)
+
+    if not dropped:
+        return False
+
+    try:
+        with open(MAPPER_CONFIG, 'w') as f:
+            f.writelines(kept)
+    except OSError as e:
+        logger.warning(f"Could not unregister {address} from button-mapper: {e}")
+        return False
+
+    logger.info(f"Unregistered {address} from button-mapper")
+    _reload_mapper()
+    return True
+
+
+def _blocks(lines):
+    """Yield (device_id_or_None, lines) per [section], preamble first."""
+    current_id, buf = None, []
+    for line in lines:
+        header = re.match(r'\s*\[(.+?)\]\s*$', line)
+        if header:
+            yield current_id, buf
+            section = header.group(1).strip()
+            current_id = section[len('device.'):] if section.startswith('device.') else ''
+            buf = [line]
+        else:
+            buf.append(line)
+    yield current_id, buf
+
+
+def _block_uniq(block) -> str:
+    for line in block:
+        key, sep, value = line.partition('=')
+        if sep and key.strip() == 'uniq':
+            return _bare_addr(value)
+    return ''
 
 
 def register_all(devices) -> None:
@@ -82,18 +145,48 @@ def register_all(devices) -> None:
     for address, _proto, name in devices:
         if address == '*':
             continue
-        added |= register_device(address, name, restart=False)
+        added |= register_device(address, name, reload=False)
     if added:
-        _restart_mapper()
+        _reload_mapper()
 
 
-def _restart_mapper() -> None:
-    # Restart only: if the user stopped the job, starting it behind their
-    # back would be rude, and the next start reads the new block anyway.
-    if not os.path.exists('/sbin/initctl'):
+def _reload_mapper() -> None:
+    """SIGHUP the running daemon so it re-reads the file where it stands.
+
+    Restarting it would tear down the mapper's uinput keyboard, and KOReader
+    stops delivering keys from a node that vanishes under it until KOReader is
+    itself restarted. Pairing must never be the thing that causes that. If the
+    daemon isn't running there is nothing to reload, and starting the job
+    behind the user's back would be rude, so that case does nothing.
+    """
+    pid = _daemon_pid()
+    if not pid:
+        logger.debug("button-mapper is not running, nothing to reload")
         return
     try:
-        subprocess.run(['/sbin/initctl', 'restart', 'kindle-button-mapper'],
-                       capture_output=True, timeout=15)
-    except Exception as e:
-        logger.debug(f"button-mapper restart skipped: {e}")
+        os.kill(pid, signal.SIGHUP)
+        logger.info(f"Asked button-mapper ({pid}) to re-read its config")
+    except OSError as e:
+        logger.warning(f"Could not signal button-mapper ({pid}): {e}")
+
+
+def _daemon_pid(proc: str = '/proc') -> int:
+    """The mapper daemon's pid, 0 if it isn't up. Its WAF helper doesn't count."""
+    try:
+        entries = os.listdir(proc)
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, entry, 'cmdline'), 'rb') as f:
+                argv = f.read().split(b'\0')
+        except OSError:
+            continue
+        if not argv or not argv[0].endswith(b'kindle-button-mapper'):
+            continue
+        if b'--waf-helper' in argv:
+            continue
+        return int(entry)
+    return 0

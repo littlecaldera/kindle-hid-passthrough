@@ -303,6 +303,10 @@ class Config:
             with open(conf_file, 'w') as f:
                 f.writelines(lines_to_keep)
             keys_removed = self.remove_pairing_key(address)
+            # Otherwise the block outlives the pairing and the device keeps
+            # showing up under the plugin's mapping menu forever.
+            import button_mapper
+            button_mapper.unregister_device(address)
 
         return {"removed": removed, "keys_removed": keys_removed}
 
