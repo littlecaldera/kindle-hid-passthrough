@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 #define FB_DEV    "/dev/fb0"
-#define WAVEFORM  "DU"          /* fast 2-level, does not hold the panel in A2 mode */
+#define WAVEFORM  "A2"          /* fast 2-level: used while the cursor moves */
 #define WAVEFORM_FULL "GC16"    /* full grayscale: clears A2 ghosting when idle */
 #define IDLE_REFRESH_US 5000000 /* GC16 cleanup after the pointer sits still this long */
 #define POLL_US   15000         /* poll/refresh cadence */
