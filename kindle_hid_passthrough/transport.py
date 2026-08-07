@@ -3,7 +3,13 @@
 
 import asyncio
 import os
-import termios
+
+# Not in every cross-compiled python bundle, and only the Broadcom UART path
+# needs it.
+try:
+    import termios
+except ImportError:
+    termios = None
 
 from bumble.device import Device
 from bumble.hci import HCI_LE_ADD_DEVICE_TO_RESOLVING_LIST_COMMAND, LeFeatureMask
@@ -49,6 +55,10 @@ def _apply_hci_termios(transport, device_path):
     pyserial clears IGNBRK on every open, so a line break arrives as a literal
     0x00 in the HCI stream and desyncs the parser (issue #120).
     """
+    if termios is None:
+        log.warning("No termios module; leaving HCI UART flags alone "
+                    "(issue #120 may resurface)")
+        return
     fd = _tty_fd(transport, device_path)
     if fd is None:
         return
