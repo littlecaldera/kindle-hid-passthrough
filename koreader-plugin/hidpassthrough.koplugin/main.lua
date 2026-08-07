@@ -195,10 +195,16 @@ end
 
 function HIDPassthrough:_attachInput(path, force)
     if input_fds[path] and not force then return end
-    if Device.input.opened_devices[path] and not input_fds[path] then return end
+    if Device.input.opened_devices[path] and not input_fds[path] then
+        logger.dbg("HIDPassthrough: leaving", path, "to KOReader")
+        return
+    end
 
     local info = checkKeyDevice(path)
-    if not info then return end
+    if not info then
+        logger.dbg("HIDPassthrough: cannot open", path, "as a key device")
+        return
+    end
 
     -- uhid recreates the node on reconnect; a stale fd makes the input poll
     -- fail with ENODEV and then nothing reaches any plugin.
@@ -210,6 +216,24 @@ function HIDPassthrough:_attachInput(path, force)
     input_fds[info.path] = Device.input:fdopen(info.fd, info.path, info.name)
     logger.info("HIDPassthrough: attached input", info.name, "@", info.path)
     self:_extendEventMap()
+end
+
+-- Take a node back that we handed to the mapper. checkKeyDevice deliberately
+-- skips keyboards, since externalkeyboard owns those, but it has no idea we
+-- closed this one behind its back and will not re-adopt without a reconnect.
+-- So open it here regardless of type rather than leave the device dead.
+function HIDPassthrough:_reclaimInput(path)
+    local FBInkInput = ffi.loadlib("fbink_input", 1)
+    local dev = FBInkInput.fbink_input_check(path, C.INPUT_KEY, 0, 0)
+    if dev == nil then return false end
+    local matched, fd, name = dev.matched, tonumber(dev.fd), ffi.string(dev.name)
+    local real = ffi.string(dev.path)
+    C.free(dev)
+    if not matched then return false end
+    input_fds[real] = Device.input:fdopen(fd, real, name)
+    logger.info("HIDPassthrough: took", real, "back from Button Mapper")
+    self:_extendEventMap()
+    return true
 end
 
 function HIDPassthrough:_detachInput(path)
@@ -358,9 +382,124 @@ local MAPPER_KINDS = {
     { section = "triggers", label = _("Trigger") },
 }
 
+-- Who owns the device node. Only one process can hold an evdev grab, so this
+-- is the difference between KOReader seeing the keys and the mapper seeing
+-- them. `grab` absent means the daemon decides from the node itself.
+local MAPPER_MODES = {
+    {
+        title = _("Automatic"),
+        note = _("Gamepads are taken over, keyboards are left to KOReader."),
+        grab = nil, passthrough = nil,
+    },
+    {
+        title = _("KOReader only"),
+        note = _("Button Mapper leaves this device alone. Mappings won't fire."),
+        grab = "false", passthrough = nil,
+    },
+    {
+        title = _("Button Mapper, keys still type"),
+        note = _("Mapped buttons run their action, everything else is passed through untouched."),
+        grab = "true", passthrough = "true",
+    },
+    {
+        title = _("Button Mapper, exclusive"),
+        note = _("Mapped buttons run their action, everything else does nothing."),
+        grab = "true", passthrough = "false",
+    },
+}
+
+function HIDPassthrough:_mapperMode(dev)
+    local text = self:_mapper().getConfig() or ""
+    local section = "device." .. dev.id
+    local grab = self:_mapper().sectionValue(text, section, "grab")
+    local passthrough = self:_mapper().sectionValue(text, section, "passthrough")
+    for dummy, mode in ipairs(MAPPER_MODES) do -- luacheck: ignore dummy
+        if mode.grab == grab and (mode.grab ~= "true" or mode.passthrough == passthrough) then
+            return mode
+        end
+    end
+    return MAPPER_MODES[1]
+end
+
+-- Only one process can hold an evdev grab, and KOReader takes one on every
+-- node it opens. So the mapper cannot claim a keyboard while KOReader has it,
+-- and the mode the user picked has to be matched by actually letting go.
+local function releaseNode(path)
+    input_fds[path] = nil
+    local ok, err = pcall(Device.input.close, Device.input, path)
+    if ok then
+        logger.info("HIDPassthrough: released", path, "for Button Mapper")
+    else
+        logger.dbg("HIDPassthrough: nothing to release at", path, err)
+    end
+end
+
+function HIDPassthrough:_applyMapperMode(dev, mode)
+    local node = self:_mapper().findNode(dev.uniq or "")
+    -- Hand the node over before the daemon is told to take it, and take it
+    -- back only after the daemon has been told to let go.
+    if node and mode.grab == "true" then
+        releaseNode(node)
+    end
+
+    local ok = self:mapperEdit(function(cur)
+        local section = "device." .. dev.id
+        for dummy, key in ipairs({ "grab", "passthrough" }) do -- luacheck: ignore dummy
+            if mode[key] then
+                cur = self:_mapper().setKey(cur, section, key, mode[key])
+            else
+                cur = self:_mapper().removeKey(cur, section, key)
+            end
+        end
+        return cur
+    end)
+
+    if node and ok and mode.grab ~= "true" then
+        -- The daemon ungrabs on its own reload tick, so give it a moment
+        -- before reopening or this grab lands while it still holds one.
+        -- Drop whatever KOReader still thinks it has first: handing the node
+        -- over leaves a stale entry that would make the reopen a no-op, and
+        -- then the device would be dead here until KOReader restarts.
+        UIManager:scheduleIn(1.5, function()
+            releaseNode(node)
+            if not self:_reclaimInput(node) then
+                logger.warn("HIDPassthrough: could not take", node, "back from Button Mapper")
+                UIManager:show(InfoMessage:new{
+                    text = _("Reconnect the device for KOReader to pick it up again."),
+                    timeout = 4,
+                })
+            end
+        end)
+    end
+    return ok
+end
+
+function HIDPassthrough:genMapperModeMenu(dev)
+    local items = {}
+    for dummy, mode in ipairs(MAPPER_MODES) do -- luacheck: ignore dummy
+        table.insert(items, {
+            text = mode.title,
+            help_text = mode.note,
+            radio = true,
+            checked_func = function() return self:_mapperMode(dev).title == mode.title end,
+            callback = function(touchmenu_instance)
+                self:_applyMapperMode(dev, mode)
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        })
+    end
+    return items
+end
+
 function HIDPassthrough:genMapperDeviceMenu(dev)
     local mapper = self:_mapper()
     local items = {
+        {
+            text_func = function()
+                return T(_("Handled by: %1"), self:_mapperMode(dev).title)
+            end,
+            sub_item_table_func = function() return self:genMapperModeMenu(dev) end,
+        },
         {
             text = _("Map a button…"),
             keep_menu_open = true,
@@ -389,10 +528,11 @@ function HIDPassthrough:genMapperDeviceMenu(dev)
         end
     end
 
-    if #items == 1 then
-        -- Only a gamepad gets a layout for free; the mapper leaves anything
-        -- else alone until something here names a button, so don't promise
-        -- defaults that a keyboard will never have.
+    -- The mode entry and "Map a button…" are always there, so anything past
+    -- them is a real mapping. Only a gamepad gets a layout for free, the
+    -- mapper leaves anything else alone until something here names a button,
+    -- so don't promise defaults that a keyboard will never have.
+    if #items == 2 then
         table.insert(items, {
             text = _("(nothing mapped — gamepads get defaults)"),
             enabled = false,
@@ -1136,6 +1276,52 @@ function HIDPassthrough:showPairedDevices()
     UIManager:show(menu)
 end
 
+-- The Bluetooth list and the mapper's device list are keyed differently, one
+-- by pairing address and one by config block, so match on the bare MAC.
+function HIDPassthrough:_mapperDeviceFor(addr)
+    local mapper = self:_mapper()
+    if not mapper.installed() then return nil end
+    local text = mapper.getConfig()
+    if not text then return nil end
+    local want = mapper.bareAddr(addr)
+    for dummy, dev in ipairs(mapper.deviceBlocks(text)) do -- luacheck: ignore dummy
+        if dev.uniq and mapper.bareAddr(dev.uniq) == want then return dev end
+    end
+end
+
+function HIDPassthrough:_showMapperModePicker(mdev, addr, proto, name, is_connected)
+    local items = {}
+    for dummy, mode in ipairs(MAPPER_MODES) do -- luacheck: ignore dummy
+        local current = self:_mapperMode(mdev).title == mode.title
+        table.insert(items, {
+            text = (current and "● " or "○ ") .. mode.title,
+            callback = function()
+                UIManager:close(self._mode_menu)
+                self._mode_menu = nil
+                self:_applyMapperMode(mdev, mode)
+                self:_showDeviceActions(addr, proto, name, is_connected)
+            end,
+        })
+    end
+
+    local menu
+    menu = Menu:new{
+        title = mdev.name or mdev.id,
+        subtitle = _("Who reads this device"),
+        item_table = items,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        is_popout = false,
+        onClose = function()
+            UIManager:close(menu)
+            self._mode_menu = nil
+            self:_showDeviceActions(addr, proto, name, is_connected)
+        end,
+    }
+    self._mode_menu = menu
+    UIManager:show(menu)
+end
+
 function HIDPassthrough:_showDeviceActions(addr, proto, name, is_connected)
     local label = (name and name ~= "" and name) or addr
     local items = {}
@@ -1158,6 +1344,20 @@ function HIDPassthrough:_showDeviceActions(addr, proto, name, is_connected)
             end,
         })
     end
+    -- Same setting as the one under Key mappings, written through the same
+    -- code. This is where people look for it, so offer it here too.
+    local mdev = self:_mapperDeviceFor(addr)
+    if mdev then
+        table.insert(items, {
+            text = T(_("Handled by: %1"), self:_mapperMode(mdev).title),
+            callback = function()
+                UIManager:close(self._action_menu)
+                self._action_menu = nil
+                self:_showMapperModePicker(mdev, addr, proto, name, is_connected)
+            end,
+        })
+    end
+
     table.insert(items, {
         text = _("Remove (forget)"),
         callback = function()

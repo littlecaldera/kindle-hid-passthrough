@@ -199,6 +199,13 @@ function M.sectionKeys(text, section)
     return out
 end
 
+-- One value from [section], or nil when the key isn't there.
+function M.sectionValue(text, section, key)
+    for dummy, entry in ipairs(M.sectionKeys(text, section)) do -- luacheck: ignore dummy
+        if entry.key == key then return entry.value end
+    end
+end
+
 -- Set key = value inside [section], creating either as needed.
 function M.setKey(text, section, key, value)
     local lines = splitLines(text)
@@ -214,7 +221,9 @@ function M.setKey(text, section, key, value)
                     return table.concat(lines, "\n") .. "\n"
                 end
             end
-            last_in_section = i
+            -- Track the last line that carries something, so a new key lands
+            -- against the block rather than after the blank line under it.
+            if line:match("%S") then last_in_section = i end
         end
     end
     if last_in_section then
