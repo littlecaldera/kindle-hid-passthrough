@@ -379,7 +379,7 @@ class HIDHost(ClassicMixin, BLEMixin):
                 bus=Bus.BLUETOOTH,
                 vendor=0,
                 product=0,
-                uniq=self.current_device_address or "",
+                uniq=normalize_addr(self.current_device_address or ""),
             )
             log.success(f"UHID device created: {name}")
             asyncio.get_event_loop().call_later(
