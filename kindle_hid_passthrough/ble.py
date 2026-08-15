@@ -433,6 +433,7 @@ class BLEMixin:
         for char in hid_service.characteristics:
             if char.uuid == GATT_HID_CONTROL_POINT_CHARACTERISTIC:
                 found_cp = True
+                self._ble_hid_control_point = char
                 try:
                     await self.peer.write_value(char, bytes([0x01]), with_response=False)
                     log.info("[BLE] Wrote Exit Suspend to HID Control Point")
@@ -440,6 +441,10 @@ class BLEMixin:
                     log.warning(f"[BLE] Failed to write HID Control Point: {e}")
 
             elif char.uuid == GATT_PROTOCOL_MODE_CHARACTERISTIC:
+                # A read is an acknowledged ATT transaction.  This is more
+                # likely to reset the remote's idle timer than the Control
+                # Point's write-without-response.
+                self._ble_keepalive_characteristic = char
                 try:
                     value = await self.peer.read_value(char)
                     mode = "Report" if bytes(value) == b'\x01' else "Boot"
@@ -452,6 +457,58 @@ class BLEMixin:
 
         if not found_cp:
             log.info(f"[BLE] No HID Control Point characteristic (found {len(hid_service.characteristics)} chars)")
+        if config.ble_hid_keepalive_interval > 0 and (
+                self._ble_keepalive_characteristic or self._ble_hid_control_point):
+            self._start_ble_hid_keepalive()
+
+    def _start_ble_hid_keepalive(self):
+        """Keep firmware-idle BLE HID remotes out of deep sleep."""
+        if self._ble_keepalive_task and not self._ble_keepalive_task.done():
+            return
+
+        task = asyncio.create_task(self._ble_hid_keepalive_loop())
+        self._ble_keepalive_task = task
+        self._connection_tasks.add(task)
+        task.add_done_callback(self._connection_tasks.discard)
+        method = (
+            "active GATT read" if self._ble_keepalive_characteristic
+            else "Exit Suspend fallback")
+        log.info(
+            f"[BLE] HID keepalive enabled every "
+            f"{config.ble_hid_keepalive_interval}s ({method})")
+
+    async def _ble_hid_keepalive_loop(self):
+        """Keep remotes awake with an ATT request that requires a response."""
+        ping_count = 0
+        try:
+            while self._is_connection_alive():
+                await asyncio.sleep(config.ble_hid_keepalive_interval)
+                if not self._is_connection_alive() or not self.peer:
+                    break
+                ping_count += 1
+                if self._ble_keepalive_characteristic:
+                    value = await self.peer.read_value(
+                        self._ble_keepalive_characteristic)
+                    mode = "Report" if bytes(value) == b'\x01' else "Boot"
+                    if ping_count == 1 or ping_count % 4 == 0:
+                        log.info(
+                            f"[BLE] Active GATT keepalive OK "
+                            f"(#{ping_count}, Protocol Mode={mode})")
+                    else:
+                        log.debug(f"[BLE] Active GATT keepalive OK (#{ping_count})")
+                elif self._ble_hid_control_point:
+                    await self.peer.write_value(
+                        self._ble_hid_control_point,
+                        bytes([0x01]),
+                        with_response=False,
+                    )
+                    log.debug("[BLE] Exit Suspend keepalive sent")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"[BLE] HID keepalive stopped: {e}")
+        finally:
+            self._ble_keepalive_task = None
 
     def _on_ble_hid_report(self, rid, data):
         # Handle BLE HID report.

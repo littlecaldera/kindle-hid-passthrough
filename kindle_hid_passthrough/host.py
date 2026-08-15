@@ -53,6 +53,9 @@ class HIDHost(ClassicMixin, BLEMixin):
         self.connected_protocol = None
 
         self._connection_tasks: set = set()
+        self._ble_hid_control_point = None
+        self._ble_keepalive_characteristic = None
+        self._ble_keepalive_task = None
 
         self.current_device_address = None
         self.device_name = None
