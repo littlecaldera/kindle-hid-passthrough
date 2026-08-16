@@ -440,16 +440,21 @@ class BLEMixin:
                 except Exception:
                     pass
 
-        if report_type == HID_REPORT_TYPE_INPUT:
-            self.hid_reports.append((report_id, char))
-            log.info(f"[BLE] Found input report {report_id}")
+        # Some inexpensive BLE HID remotes advertise the characteristic that
+        # carries their consumer keys with the wrong Report Reference type.
+        # Try every Report characteristic; non-notifying Feature/Output
+        # reports are harmlessly rejected by subscribe() below.
+        self.hid_reports.append((report_id, char))
+        log.info(f"[BLE] Found report type={report_type} id={report_id}")
 
     async def _subscribe_to_ble_reports(self):
         """Subscribe to BLE HID input report notifications."""
         for report_id, char in self.hid_reports:
             try:
-                callback = lambda value, rid=report_id: self._on_ble_hid_report(rid, value)
-                await self.peer.subscribe(char, callback)
+                def make_callback(rid):
+                    return lambda value: self._on_ble_hid_report(value, rid)
+
+                await self.peer.subscribe(char, make_callback(report_id))
                 log.success(f"[BLE] Subscribed to report {report_id}")
             except Exception as e:
                 log.warning(f"[BLE] Failed to subscribe to report {report_id}: {e}")
@@ -521,9 +526,11 @@ class BLEMixin:
         self._connection_tasks.add(task)
         task.add_done_callback(self._connection_tasks.discard)
         method = (
-            "acknowledged GATT read"
+            "Exit Suspend + acknowledged link probe"
+            if self._ble_keepalive_characteristic and self._ble_hid_control_point
+            else "acknowledged link probe"
             if self._ble_keepalive_characteristic
-            else "Exit Suspend fallback"
+            else "Exit Suspend"
         )
         log.info(
             f"[BLE] HID keepalive enabled every "
@@ -541,20 +548,11 @@ class BLEMixin:
                     did_ping = False
                     mode = None
 
-                    # Prefer an ATT request that the remote must answer.  The
-                    # old Exit Suspend keepalive was a write-without-response,
-                    # so it could neither prove that Free2 was alive nor reset
-                    # firmware that only counts acknowledged host activity.
-                    if self._ble_keepalive_characteristic:
-                        value = await asyncio.wait_for(
-                            self.peer.read_value(
-                                self._ble_keepalive_characteristic),
-                            timeout=3.0,
-                        )
-                        mode = (
-                            "Report" if bytes(value) == b'\x01' else "Boot")
-                        did_ping = True
-                    elif self._ble_hid_control_point:
+                    # Protocol Mode reads prove that the ATT link is alive, but
+                    # Free2 does not treat a read as HID activity.  Keep sending
+                    # the HID-defined Exit Suspend command as the actual wake
+                    # request, then read Protocol Mode to verify the link.
+                    if self._ble_hid_control_point:
                         await asyncio.wait_for(
                             self.peer.write_value(
                                 self._ble_hid_control_point,
@@ -563,6 +561,16 @@ class BLEMixin:
                             ),
                             timeout=3.0,
                         )
+                        did_ping = True
+
+                    if self._ble_keepalive_characteristic:
+                        value = await asyncio.wait_for(
+                            self.peer.read_value(
+                                self._ble_keepalive_characteristic),
+                            timeout=3.0,
+                        )
+                        mode = (
+                            "Report" if bytes(value) == b'\x01' else "Boot")
                         did_ping = True
 
                     if not did_ping:
@@ -575,9 +583,9 @@ class BLEMixin:
                         suffix = (
                             f", Protocol Mode={mode}" if mode else "")
                         log.info(
-                            f"[BLE] HID keepalive OK (#{ping_count}{suffix})")
+                            f"[BLE] HID wake sent; link alive (#{ping_count}{suffix})")
                     else:
-                        log.debug(f"[BLE] HID keepalive OK (#{ping_count})")
+                        log.debug(f"[BLE] HID wake sent; link alive (#{ping_count})")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -592,15 +600,11 @@ class BLEMixin:
             if self._ble_keepalive_task is asyncio.current_task():
                 self._ble_keepalive_task = None
 
-    def _on_ble_hid_report(self, rid, data):
-        # Handle BLE HID report.
-        # [consumer-forwarding fix] 转发**所有**收到的 HID 报告（键盘 ID5 与
-        # 消费类 ID1 一并转发），使旋钮旋转（音量±）与双击（主页）进入 evdev。
-        try:
-            log.info("[BLE] Forwarding report rid=%s len=%s", rid, len(data))
-        except Exception:
-            pass
-        try:
-            self._forward_report(data)
-        except Exception as e:
-            log.warning("[BLE] Forward failed: %s", e)
+    def _on_ble_hid_report(self, value, report_id):
+        """Forward a BLE Report value in the format UHID expects."""
+        # A GATT Report characteristic omits the HID Report ID from its value,
+        # while the combined UHID descriptor contains several numbered reports.
+        # Dropping this prefix makes Linux ignore every Free2 button report.
+        data = bytes([report_id]) + bytes(value)
+        log.debug(f"[BLE] Report received rid={report_id} len={len(value)}")
+        self._forward_report(data)

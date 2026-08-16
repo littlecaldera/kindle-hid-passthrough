@@ -98,14 +98,23 @@ class BLEReconnectRegressionTests(unittest.TestCase):
         self.assertIsInstance(process_reports, ast.Constant)
         self.assertIs(process_reports.value, True)
 
-    def test_notification_callback_keeps_report_id_before_payload(self):
+    def test_notification_callback_passes_payload_then_report_id(self):
         subscribe = self.methods["_subscribe_to_ble_reports"]
         callback_call = next(
             call
             for call in _self_calls(subscribe)
             if call.func.attr == "_on_ble_hid_report"
         )
-        self.assertEqual([arg.id for arg in callback_call.args], ["rid", "value"])
+        self.assertEqual([arg.id for arg in callback_call.args], ["value", "rid"])
+
+    def test_forwarded_ble_report_restores_report_id_prefix(self):
+        handler = self.methods["_on_ble_hid_report"]
+        forward_call = next(
+            call
+            for call in _self_calls(handler)
+            if call.func.attr == "_forward_report"
+        )
+        self.assertEqual(forward_call.args[0].id, "data")
 
     def test_keepalive_uses_control_point_and_active_gatt_read(self):
         keepalive = self.methods["_ble_hid_keepalive_loop"]
