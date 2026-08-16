@@ -352,8 +352,15 @@ class BLEMixin:
 
     async def _setup_ble_hid(self):
         """Discover reports, create UHID, subscribe. Common to connect and post-pair."""
-        if not self.hid_reports:
-            await self._discover_ble_hid_service(process_reports=True)
+        await self._stop_ble_hid_keepalive()
+
+        # GATT characteristic objects belong to a single connection.  Reusing
+        # them after a disconnect makes cached reconnects fail or subscribe to
+        # dead handles, so rebuild all per-connection state every time.
+        self.hid_reports = []
+        self._ble_hid_control_point = None
+        self._ble_keepalive_characteristic = None
+        await self._discover_ble_hid_service(process_reports=True)
         if not self.report_map:
             raise InvalidStateError("[BLE] No report descriptor available")
         self._create_uhid_device()
@@ -380,6 +387,42 @@ class BLEMixin:
         except Exception as e:
             log.warning(f"[BLE] Could not read device name: {e}")
 
+    async def _discover_ble_hid_service(self, process_reports: bool = False):
+        """Discover the BLE HID service and rebuild connection-local handles."""
+        await self.peer.discover_services()
+
+        if not self.device_name:
+            await self._read_ble_device_name()
+
+        hid_services = [
+            service for service in self.peer.services
+            if service.uuid == GATT_HUMAN_INTERFACE_DEVICE_SERVICE
+        ]
+        if not hid_services:
+            if process_reports:
+                raise InvalidStateError("[BLE] HID service not found")
+            log.warning("[BLE] HID service not found")
+            return
+
+        hid_service = hid_services[0]
+        log.success("[BLE] Found HID service")
+        await self.peer.discover_characteristics(service=hid_service)
+
+        for char in hid_service.characteristics:
+            if char.uuid == GATT_REPORT_MAP_CHARACTERISTIC and not self.report_map:
+                try:
+                    value = await self.peer.read_value(char)
+                    self.report_map = bytes(value)
+                    log.success(f"[BLE] Got descriptor: {len(self.report_map)} bytes")
+                    self.device_cache.save(self.current_device_address, {
+                        "report_map": self.report_map.hex(),
+                        "device_name": self.device_name,
+                    })
+                except Exception as e:
+                    log.warning(f"[BLE] Failed to read report map: {e}")
+            elif process_reports and char.uuid == GATT_REPORT_CHARACTERISTIC:
+                await self._process_ble_report_char(char)
+
     async def _process_ble_report_char(self, char):
         """Process a BLE Report characteristic."""
         await self.peer.discover_descriptors(characteristic=char)
@@ -405,10 +448,8 @@ class BLEMixin:
         """Subscribe to BLE HID input report notifications."""
         for report_id, char in self.hid_reports:
             try:
-                def make_callback(rid):
-                    return lambda value: self._on_ble_hid_report(value, rid)
-
-                await self.peer.subscribe(char, make_callback(report_id))
+                callback = lambda value, rid=report_id: self._on_ble_hid_report(rid, value)
+                await self.peer.subscribe(char, callback)
                 log.success(f"[BLE] Subscribed to report {report_id}")
             except Exception as e:
                 log.warning(f"[BLE] Failed to subscribe to report {report_id}: {e}")
@@ -461,6 +502,15 @@ class BLEMixin:
                 self._ble_keepalive_characteristic or self._ble_hid_control_point):
             self._start_ble_hid_keepalive()
 
+    async def _stop_ble_hid_keepalive(self):
+        """Stop a keepalive task left behind by a previous BLE connection."""
+        task = getattr(self, "_ble_keepalive_task", None)
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if getattr(self, "_ble_keepalive_task", None) is task:
+            self._ble_keepalive_task = None
+
     def _start_ble_hid_keepalive(self):
         """Keep firmware-idle BLE HID remotes out of deep sleep."""
         if self._ble_keepalive_task and not self._ble_keepalive_task.done():
@@ -470,45 +520,78 @@ class BLEMixin:
         self._ble_keepalive_task = task
         self._connection_tasks.add(task)
         task.add_done_callback(self._connection_tasks.discard)
-        method = (
-            "active GATT read" if self._ble_keepalive_characteristic
-            else "Exit Suspend fallback")
+        actions = []
+        if self._ble_hid_control_point:
+            actions.append("Exit Suspend")
+        if self._ble_keepalive_characteristic:
+            actions.append("active GATT read")
+        method = " + ".join(actions)
         log.info(
             f"[BLE] HID keepalive enabled every "
             f"{config.ble_hid_keepalive_interval}s ({method})")
 
     async def _ble_hid_keepalive_loop(self):
-        """Keep remotes awake with an ATT request that requires a response."""
+        """Keep remotes awake without letting one transient error kill the loop."""
         ping_count = 0
         try:
             while self._is_connection_alive():
                 await asyncio.sleep(config.ble_hid_keepalive_interval)
                 if not self._is_connection_alive() or not self.peer:
                     break
-                ping_count += 1
-                if self._ble_keepalive_characteristic:
-                    value = await self.peer.read_value(
-                        self._ble_keepalive_characteristic)
-                    mode = "Report" if bytes(value) == b'\x01' else "Boot"
+                try:
+                    did_ping = False
+                    mode = None
+
+                    # Some remotes use the HID Control Point command to reset
+                    # their own idle timer, while others only react to an ATT
+                    # transaction requiring a reply.  Do both when available.
+                    if self._ble_hid_control_point:
+                        await asyncio.wait_for(
+                            self.peer.write_value(
+                                self._ble_hid_control_point,
+                                bytes([0x01]),
+                                with_response=False,
+                            ),
+                            timeout=3.0,
+                        )
+                        did_ping = True
+
+                    if self._ble_keepalive_characteristic:
+                        value = await asyncio.wait_for(
+                            self.peer.read_value(
+                                self._ble_keepalive_characteristic),
+                            timeout=3.0,
+                        )
+                        mode = (
+                            "Report" if bytes(value) == b'\x01' else "Boot")
+                        did_ping = True
+
+                    if not did_ping:
+                        log.warning(
+                            "[BLE] No usable HID keepalive characteristic")
+                        break
+
+                    ping_count += 1
                     if ping_count == 1 or ping_count % 4 == 0:
+                        suffix = (
+                            f", Protocol Mode={mode}" if mode else "")
                         log.info(
-                            f"[BLE] Active GATT keepalive OK "
-                            f"(#{ping_count}, Protocol Mode={mode})")
+                            f"[BLE] HID keepalive OK (#{ping_count}{suffix})")
                     else:
-                        log.debug(f"[BLE] Active GATT keepalive OK (#{ping_count})")
-                elif self._ble_hid_control_point:
-                    await self.peer.write_value(
-                        self._ble_hid_control_point,
-                        bytes([0x01]),
-                        with_response=False,
-                    )
-                    log.debug("[BLE] Exit Suspend keepalive sent")
+                        log.debug(f"[BLE] HID keepalive OK (#{ping_count})")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # BLE can briefly reject an ATT operation around connection
+                    # parameter changes.  The next interval should still retry.
+                    if self._is_connection_alive():
+                        log.warning(
+                            f"[BLE] HID keepalive attempt failed; retrying: {e}")
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            log.warning(f"[BLE] HID keepalive stopped: {e}")
         finally:
-            self._ble_keepalive_task = None
+            if self._ble_keepalive_task is asyncio.current_task():
+                self._ble_keepalive_task = None
 
     def _on_ble_hid_report(self, rid, data):
         # Handle BLE HID report.

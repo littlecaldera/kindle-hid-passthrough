@@ -335,6 +335,11 @@ class HIDHost(ClassicMixin, BLEMixin):
         addr = self.current_device_address or "unknown"
         log.warning(f"[{proto}] Device disconnected: {addr} (reason={reason})")
 
+        keepalive_task = getattr(self, "_ble_keepalive_task", None)
+        if keepalive_task is not None and not keepalive_task.done():
+            keepalive_task.cancel()
+        self._ble_keepalive_task = None
+
         if reason == 5 and self.current_device_address and proto == "CLASSIC":
             log.info("[Classic] Authentication failure - will clear stale key and retry")
             self._auth_failure_address = self.current_device_address
@@ -414,6 +419,8 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     async def cleanup(self):
         """Clean up resources."""
+        await self._stop_ble_hid_keepalive()
+
         if self._connection_tasks:
             pending = list(self._connection_tasks)
             for task in pending:
