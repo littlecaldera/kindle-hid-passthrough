@@ -520,12 +520,11 @@ class BLEMixin:
         self._ble_keepalive_task = task
         self._connection_tasks.add(task)
         task.add_done_callback(self._connection_tasks.discard)
-        actions = []
-        if self._ble_hid_control_point:
-            actions.append("Exit Suspend")
-        if self._ble_keepalive_characteristic:
-            actions.append("active GATT read")
-        method = " + ".join(actions)
+        method = (
+            "acknowledged GATT read"
+            if self._ble_keepalive_characteristic
+            else "Exit Suspend fallback"
+        )
         log.info(
             f"[BLE] HID keepalive enabled every "
             f"{config.ble_hid_keepalive_interval}s ({method})")
@@ -542,20 +541,10 @@ class BLEMixin:
                     did_ping = False
                     mode = None
 
-                    # Some remotes use the HID Control Point command to reset
-                    # their own idle timer, while others only react to an ATT
-                    # transaction requiring a reply.  Do both when available.
-                    if self._ble_hid_control_point:
-                        await asyncio.wait_for(
-                            self.peer.write_value(
-                                self._ble_hid_control_point,
-                                bytes([0x01]),
-                                with_response=False,
-                            ),
-                            timeout=3.0,
-                        )
-                        did_ping = True
-
+                    # Prefer an ATT request that the remote must answer.  The
+                    # old Exit Suspend keepalive was a write-without-response,
+                    # so it could neither prove that Free2 was alive nor reset
+                    # firmware that only counts acknowledged host activity.
                     if self._ble_keepalive_characteristic:
                         value = await asyncio.wait_for(
                             self.peer.read_value(
@@ -564,6 +553,16 @@ class BLEMixin:
                         )
                         mode = (
                             "Report" if bytes(value) == b'\x01' else "Boot")
+                        did_ping = True
+                    elif self._ble_hid_control_point:
+                        await asyncio.wait_for(
+                            self.peer.write_value(
+                                self._ble_hid_control_point,
+                                bytes([0x01]),
+                                with_response=False,
+                            ),
+                            timeout=3.0,
+                        )
                         did_ping = True
 
                     if not did_ping:
