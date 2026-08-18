@@ -2,7 +2,7 @@ name: Build ARM Binary
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/brcm-reconnect-stable]
     tags: ['v*']
   pull_request:
     branches: [main]
