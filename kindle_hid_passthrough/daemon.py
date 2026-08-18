@@ -152,9 +152,13 @@ class HIDDaemon:
                 continue
 
             skip_delay = False
-            chip().ensure_powered()
-
             try:
+                # Hardware recovery belongs inside the reconnect guard. A BCM
+                # re-warm failure must log and retry, not terminate the daemon
+                # and silently clear the UI checkbox.
+                if chip().ensure_powered() is False:
+                    raise RuntimeError("Bluetooth controller preparation failed")
+
                 # Use handed-off host from controller pairing if available
                 if self._paired_host:
                     logger.info("=== Continuing with paired device ===")

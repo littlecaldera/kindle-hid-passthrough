@@ -66,12 +66,8 @@ def _wait_for_bsa():
     return False
 
 
-def _recover_btd():
-    """Unfreeze and restart btd so it can respawn bsa_server.
-
-    A btd left frozen by a prior handoff makes `initctl restart` hang, so
-    SIGCONT it first.
-    """
+def _restart_btd():
+    """Unfreeze and restart btd after taking the UART away from BSA."""
     for pid in _pgrep_x('btd'):
         try:
             os.kill(pid, signal.SIGCONT)
@@ -79,6 +75,11 @@ def _recover_btd():
             pass
     run(['initctl', 'restart', 'btd'])
     time.sleep(2.0)
+
+
+def _recover_btd():
+    """Restart btd and ask btfd to respawn bsa_server."""
+    _restart_btd()
     run(BTENABLE_LIPC)
 
 
@@ -195,15 +196,8 @@ class BrcmChip(BtChip):
         except OSError:
             pass
 
-    def pre_open(self):
-        """Wake the chip and confirm it answers a raw HCI Reset before bumble
-        opens the transport.
-
-        On some BCM Kindles (KOA2/KOA3, zelda) the chip is still asleep when the
-        first HCI command goes out, so bumble's reset times out. Retrying at the
-        bumble layer corrupts its command pipeline, so we do the wake handshake
-        here on our own fd and only hand a proven-awake chip to bumble.
-        """
+    def _probe_awake(self):
+        """Wake the handed-off controller and return whether HCI responds."""
         import serial
         self._assert_wake()
         time.sleep(POST_WAKE_SETTLE)
@@ -221,7 +215,9 @@ class BrcmChip(BtChip):
                 s.open()
             except (OSError, ValueError) as e:
                 log.warning(f"BCM wake probe could not open transport: {e}")
-                return
+                self._wake_pulse()
+                time.sleep(0.2)
+                continue
             try:
                 time.sleep(0.1)
                 cts = s.cts
@@ -249,14 +245,43 @@ class BrcmChip(BtChip):
             if resp.startswith(HCI_RESET_OK):
                 log.info(f"BCM chip awake; answered HCI Reset "
                          f"(cts={cts}, {self._sleep_state()})")
-                return
+                return True
             log.warning(f"BCM wake attempt {attempt}/{WAKE_VERIFY_ATTEMPTS}: "
                         f"no HCI Reset reply (cts={cts} wrote={wrote} "
                         f"resp={resp.hex() or 'none'} {self._sleep_state()})")
             self._wake_pulse()
             time.sleep(0.2)
-        log.error("BCM chip never answered a raw HCI Reset after wake; "
-                  "transport reset will likely time out")
+        return False
+
+    def pre_open(self):
+        """Hand only a proven-awake controller to Bumble.
+
+        A disconnect can leave `_warm` true while the physical BCM controller
+        is no longer answering. Raw wake pulses cannot repair that state: the
+        Kindle Bluetooth stack must reload the firmware through bsa_server and
+        hand the UART back to us. Perform that full recovery once here, before
+        Bumble opens the transport and corrupts its command pipeline.
+        """
+        with self._power_lock:
+            if self._probe_awake():
+                return
+
+            log.warning(
+                "BCM controller stopped answering after handoff; "
+                "forcing a full btfd/bsa re-warm"
+            )
+            self.power_off()
+            if not self.prepare():
+                raise RuntimeError("BCM full re-warm failed")
+
+            if self._probe_awake():
+                log.info("BCM controller recovered after full re-warm")
+                return
+
+            self.power_off()
+            raise RuntimeError(
+                "BCM controller still does not answer HCI after full re-warm"
+            )
 
     def on_transport_open(self):
         self._assert_wake()
@@ -276,15 +301,18 @@ class BrcmChip(BtChip):
             self._warm = False
             self._latency.release()
             try:
-                if open(BT_ENABLE_PATH).read().strip() == '0':
-                    return
-                with open(BT_ENABLE_PATH, 'w') as f:
-                    f.write('0')
-                log.info("BCM chip powered off (btenable=0)")
+                if open(BT_ENABLE_PATH).read().strip() != '0':
+                    with open(BT_ENABLE_PATH, 'w') as f:
+                        f.write('0')
+                    log.info("BCM chip powered off (btenable=0)")
+                else:
+                    log.info("BCM chip already reports btenable=0")
             except OSError as e:
                 log.warning(f"Could not power off BCM chip: {e}")
-                return
-            run(['initctl', 'restart', 'btd'])   # resets btfd BTstate -> clears the icon
+            # btd is SIGSTOP'd during a warm handoff. Even when btenable is
+            # already 0 it must be resumed and restarted, otherwise the next
+            # BTEnable cannot spawn bsa_server and the daemon appears stuck.
+            _restart_btd()
 
     def on_hci_reset_timeout(self):
         log.warning("HCI Reset timed out on BCM; powering off for a clean re-warm")
@@ -296,8 +324,8 @@ class BrcmChip(BtChip):
             # trust our own _warm flag to decide whether a re-warm is needed.
             if self._warm:
                 if not _pgrep_x('bsa_server'):
-                    return
+                    return True
                 # bsa respawned behind our handoff: chip state unknown
                 log.warning("bsa_server respawned after handoff; power-cycling chip")
                 self.power_off()
-            self.prepare()
+            return self.prepare()

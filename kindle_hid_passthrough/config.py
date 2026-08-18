@@ -136,6 +136,8 @@ class Config:
         self.hci_reset_timeout = self._getint('connection', 'hci_reset_timeout', 10)
         self.connect_timeout = self._getint('connection', 'connect_timeout', 30)
         self.transport_timeout = self._getint('connection', 'transport_timeout', 30)
+        self.ble_hid_keepalive_interval = self._getint(
+            'connection', 'ble_hid_keepalive_interval', 30)
 
         # Bluetooth hardware setup
         self.bt_module_patterns = self._get_list('bluetooth', 'module_patterns', None)

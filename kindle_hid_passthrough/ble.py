@@ -433,6 +433,7 @@ class BLEMixin:
         for char in hid_service.characteristics:
             if char.uuid == GATT_HID_CONTROL_POINT_CHARACTERISTIC:
                 found_cp = True
+                self._ble_hid_control_point = char
                 try:
                     await self.peer.write_value(char, bytes([0x01]), with_response=False)
                     log.info("[BLE] Wrote Exit Suspend to HID Control Point")
@@ -453,15 +454,55 @@ class BLEMixin:
         if not found_cp:
             log.info(f"[BLE] No HID Control Point characteristic (found {len(hid_service.characteristics)} chars)")
 
-    def _on_ble_hid_report(self, rid, data):
-        # Handle BLE HID report.
-        # [consumer-forwarding fix] 转发**所有**收到的 HID 报告（键盘 ID5 与
-        # 消费类 ID1 一并转发），使旋钮旋转（音量±）与双击（主页）进入 evdev。
+        if found_cp and config.ble_hid_keepalive_interval > 0:
+            self._start_ble_hid_keepalive()
+
+    async def _stop_ble_hid_keepalive(self):
+        """Cancel a keepalive task before its GATT handles become stale."""
+        task = getattr(self, '_ble_keepalive_task', None)
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if getattr(self, '_ble_keepalive_task', None) is task:
+            self._ble_keepalive_task = None
+
+    def _start_ble_hid_keepalive(self):
+        """Periodically repeat HID Exit Suspend while the link is quiet."""
+        if self._ble_keepalive_task and not self._ble_keepalive_task.done():
+            return
+        task = asyncio.create_task(self._ble_hid_keepalive_loop())
+        self._ble_keepalive_task = task
+        self._connection_tasks.add(task)
+        task.add_done_callback(self._connection_tasks.discard)
+        log.info(
+            f"[BLE] HID keepalive enabled every "
+            f"{config.ble_hid_keepalive_interval}s"
+        )
+
+    async def _ble_hid_keepalive_loop(self):
+        """Repeat the same HID command used by the known-good build."""
         try:
-            log.info("[BLE] Forwarding report rid=%s len=%s", rid, len(data))
-        except Exception:
-            pass
-        try:
-            self._forward_report(data)
+            while self._is_connection_alive():
+                await asyncio.sleep(config.ble_hid_keepalive_interval)
+                if not self._is_connection_alive() or not self.peer:
+                    break
+                await self.peer.write_value(
+                    self._ble_hid_control_point,
+                    bytes([0x01]),
+                    with_response=False,
+                )
+                log.info("[BLE] HID keepalive sent")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.warning("[BLE] Forward failed: %s", e)
+            log.warning(f"[BLE] HID keepalive stopped: {e}")
+        finally:
+            if self._ble_keepalive_task is asyncio.current_task():
+                self._ble_keepalive_task = None
+
+    def _on_ble_hid_report(self, value, report_id):
+        """Restore the Report ID omitted from a GATT Report value."""
+        data = bytes(value)
+        if report_id:
+            data = bytes([report_id]) + data
+        self._forward_report(data)
