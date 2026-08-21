@@ -66,13 +66,18 @@ def _wait_for_bsa():
     return False
 
 
-def _restart_btd():
-    """Unfreeze and restart btd after taking the UART away from BSA."""
+def _resume_btd():
+    """Undo the SIGSTOP used while the passthrough owns the UART."""
     for pid in _pgrep_x('btd'):
         try:
             os.kill(pid, signal.SIGCONT)
         except OSError:
             pass
+
+
+def _restart_btd():
+    """Unfreeze and restart btd after taking the UART away from BSA."""
+    _resume_btd()
     run(['initctl', 'restart', 'btd'])
     time.sleep(2.0)
 
@@ -296,7 +301,7 @@ class BrcmChip(BtChip):
     def on_transport_close(self):
         self._latency.release()
 
-    def power_off(self):
+    def _power_off(self, restart_btd):
         with self._power_lock:
             self._warm = False
             self._latency.release()
@@ -309,10 +314,22 @@ class BrcmChip(BtChip):
                     log.info("BCM chip already reports btenable=0")
             except OSError as e:
                 log.warning(f"Could not power off BCM chip: {e}")
-            # btd is SIGSTOP'd during a warm handoff. Even when btenable is
-            # already 0 it must be resumed and restarted, otherwise the next
-            # BTEnable cannot spawn bsa_server and the daemon appears stuck.
-            _restart_btd()
+            # btd is SIGSTOP'd during a warm handoff. Always resume it. A hard
+            # recovery also restarts it so the next BTEnable can spawn BSA.
+            # Immediately before system suspend, however, starting an initctl
+            # restart is unsafe: powerd can freeze btd halfway through teardown
+            # and leave the controller unavailable for minutes after wake.
+            if restart_btd:
+                _restart_btd()
+            else:
+                _resume_btd()
+
+    def power_off(self):
+        self._power_off(restart_btd=True)
+
+    def suspend_power_off(self):
+        """Fast, freeze-safe shutdown for powerd's readyToSuspend event."""
+        self._power_off(restart_btd=False)
 
     def on_hci_reset_timeout(self):
         log.warning("HCI Reset timed out on BCM; powering off for a clean re-warm")

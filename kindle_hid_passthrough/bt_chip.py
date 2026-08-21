@@ -63,5 +63,13 @@ class BtChip:
     def power_off(self):
         """Turn the radio off (BT-off toggle)."""
 
+    def suspend_power_off(self):
+        """Turn the radio off immediately before system suspend.
+
+        Backends may override this when their normal recovery power-off does
+        extra service restarts that are unsafe to begin as the OS freezes.
+        """
+        self.power_off()
+
     def ensure_powered(self):
         """Re-arm the chip before a (re)connect if it was powered off."""

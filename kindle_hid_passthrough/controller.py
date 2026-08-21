@@ -35,6 +35,7 @@ class DaemonController:
 
         self._op_lock = asyncio.Lock()
         self._suspended_by_system = False
+        self._chip_powered_off_for_suspend = False
 
         # Scan state
         self.scan_result = None
@@ -208,6 +209,7 @@ class DaemonController:
     async def _do_resume(self):
         async with self._op_lock:
             self._suspended_by_system = False
+            self._chip_powered_off_for_suspend = False
             if self.daemon._suspended:
                 await self.daemon.resume()
 
@@ -229,12 +231,31 @@ class DaemonController:
 
     async def _do_system_suspend(self, event):
         async with self._op_lock:
-            if self.daemon._suspended:
+            if event == 'goingToScreenSaver':
+                if self.daemon._suspended:
+                    return
+                logger.info(
+                    "System preparing to suspend: closing Bluetooth transport"
+                )
+                self._suspended_by_system = True
+                self._chip_powered_off_for_suspend = False
+                await self.daemon.suspend()
                 return
-            logger.info(f"System suspend ({event}): powering BT off")
-            self._suspended_by_system = True
-            await self.daemon.suspend()
-            chip().power_off()
+
+            # readyToSuspend follows goingToScreenSaver on a real sleep. Keep
+            # the slow disconnect in the early phase, but delay the physical
+            # power cut until this final event. If the screen saver transition
+            # is cancelled, outOfScreenSaver simply reconnects without a power
+            # cycle. Handle a missing early event defensively as well.
+            if not self._suspended_by_system:
+                self._suspended_by_system = True
+                self._chip_powered_off_for_suspend = False
+            if not self.daemon._suspended:
+                await self.daemon.suspend()
+            if not self._chip_powered_off_for_suspend:
+                logger.info(f"System suspend ({event}): powering BT off")
+                chip().suspend_power_off()
+                self._chip_powered_off_for_suspend = True
 
     def on_system_resume(self, event):
         """From power monitor thread: re-warm BT after wake."""
@@ -245,6 +266,7 @@ class DaemonController:
             if not self._suspended_by_system:
                 return
             self._suspended_by_system = False
+            self._chip_powered_off_for_suspend = False
             if not self.daemon._suspended:
                 return
             logger.info(f"System resume ({event}): restarting BT")

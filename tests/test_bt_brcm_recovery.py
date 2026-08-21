@@ -77,6 +77,18 @@ def test_power_off_restarts_frozen_btd_even_if_already_disabled():
     assert chip._latency.releases == 1
 
 
+def test_suspend_power_off_only_resumes_btd():
+    chip = chip_for_test(iter(()))
+    with patch('builtins.open', mock_open(read_data='1')), \
+            patch.object(bt_brcm, '_resume_btd') as resume, \
+            patch.object(bt_brcm, '_restart_btd') as restart:
+        chip.suspend_power_off()
+    resume.assert_called_once_with()
+    restart.assert_not_called()
+    assert chip._warm is False
+    assert chip._latency.releases == 1
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failed = 0
