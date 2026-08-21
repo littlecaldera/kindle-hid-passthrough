@@ -134,12 +134,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "enabled": enabled, "error": err[-200:]})
 
     def _handle_start(self):
-        controller = self._controller
-        if controller.daemon.running and not controller.daemon._suspended:
-            self._send_json({"ok": True, "message": "Daemon already running"})
-            return
-        controller.request_connect()
-        self._send_json({"ok": True, "message": "Daemon resuming"})
+        # The daemon can still report "running" while the Broadcom controller
+        # is wedged after a Kindle lifecycle transition.  Always pass a manual
+        # reconnect request to the controller so it can recycle the session.
+        self._controller.request_connect()
+        self._send_json({"ok": True, "message": "Reconnect requested"})
 
     def _handle_stop(self):
         controller = self._controller

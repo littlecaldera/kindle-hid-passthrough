@@ -19,6 +19,18 @@ from logging_utils import errstr
 
 logger = logging.getLogger(__name__)
 
+# A healthy cleanup can spend up to 7 seconds in its bounded L2CAP,
+# connection, and transport-close waits.  Leave enough room for those waits
+# before treating the whole session as stuck.
+MANUAL_RECONNECT_SUSPEND_TIMEOUT = 10.0
+
+# Broadcom prepare/pre_open currently contains synchronous firmware and UART
+# recovery work.  If that blocks the event loop, an asyncio timeout cannot
+# fire, so an independent thread is the final escape hatch.  The installed
+# Upstart job has `respawn`, giving the replacement daemon a completely fresh
+# task graph and a freshly closed UART fd table.
+MANUAL_RECONNECT_WATCHDOG_TIMEOUT = 15.0
+
 __all__ = ['DaemonController']
 
 
@@ -36,6 +48,10 @@ class DaemonController:
         self._op_lock = asyncio.Lock()
         self._suspended_by_system = False
         self._chip_powered_off_for_suspend = False
+        self._manual_reconnect_future = None
+        self._manual_reconnect_watchdog = None
+        self._hard_restart_lock = threading.Lock()
+        self._hard_restart_requested = False
 
         # Scan state
         self.scan_result = None
@@ -195,10 +211,39 @@ class DaemonController:
         """From HTTP thread: connect to a device or resume the daemon.
 
         With address: suspend → save device to config → resume.
-        Without address: just resume if suspended (used by /start).
+        Without address: recycle the current Bluetooth session and reconnect
+        configured devices (used by /start).
         """
         if not address:
-            asyncio.run_coroutine_threadsafe(self._do_resume(), self.loop)
+            # Coalesce repeated button presses.  Multiple queued power cycles
+            # make recovery slower and can race system suspend notifications.
+            pending = self._manual_reconnect_future
+            if pending is not None and not pending.done():
+                logger.info("Manual reconnect already in progress")
+                return
+
+            future = asyncio.run_coroutine_threadsafe(
+                self._do_resume(), self.loop
+            )
+            self._manual_reconnect_future = future
+
+            watchdog = threading.Timer(
+                MANUAL_RECONNECT_WATCHDOG_TIMEOUT,
+                self._manual_reconnect_watchdog_expired,
+                args=(future,),
+            )
+            watchdog.daemon = True
+            self._manual_reconnect_watchdog = watchdog
+
+            def reconnect_done(_future):
+                watchdog.cancel()
+                if self._manual_reconnect_future is _future:
+                    self._manual_reconnect_future = None
+                if self._manual_reconnect_watchdog is watchdog:
+                    self._manual_reconnect_watchdog = None
+
+            future.add_done_callback(reconnect_done)
+            watchdog.start()
             return
 
         protocol = Protocol.CLASSIC if protocol_str == 'classic' else Protocol.BLE
@@ -210,8 +255,76 @@ class DaemonController:
         async with self._op_lock:
             self._suspended_by_system = False
             self._chip_powered_off_for_suspend = False
-            if self.daemon._suspended:
-                await self.daemon.resume()
+
+            # If the live link is healthy, dropping it is enough: daemon.run()
+            # owns the normal cleanup and reconnect loop.  Do not needlessly
+            # reload Broadcom firmware for this case.
+            host = self.daemon.host
+            if host and host._is_connection_alive():
+                logger.info("Manual reconnect: dropping healthy device link")
+                await self.daemon.disconnect()
+                return
+
+            logger.info("Manual reconnect: recycling Bluetooth session")
+            try:
+                await asyncio.wait_for(
+                    self.daemon.suspend(),
+                    timeout=MANUAL_RECONNECT_SUSPEND_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                self._hard_restart(
+                    "old Bluetooth session did not stop before timeout",
+                    power_off=True,
+                )
+                return
+            except Exception as e:
+                self._hard_restart(
+                    f"Bluetooth session cleanup failed: {errstr(e)}",
+                    power_off=True,
+                )
+                return
+
+            # A successful suspend has closed the old transport.  On resume,
+            # BrcmChip.pre_open() probes raw HCI Reset and performs the full
+            # power-off/btfd/BSA re-warm only when the controller is actually
+            # unresponsive.
+            await self.daemon.resume()
+
+    def _manual_reconnect_watchdog_expired(self, future):
+        """Hard-stop a daemon whose event loop cannot service reconnect."""
+        if future.done():
+            return
+        self._hard_restart(
+            "manual reconnect watchdog expired (event loop or cleanup stuck)",
+            power_off=False,
+        )
+
+    def _hard_restart(self, reason, power_off):
+        """Terminate this wedged daemon; Upstart respawns a clean process.
+
+        This is intentionally a process-level fallback.  Resuming in the same
+        process after an uncooperative cancelled task can leave that task using
+        a stale Bumble transport while the replacement session opens the same
+        UART.  Process exit closes every fd and makes that overlap impossible.
+        """
+        with self._hard_restart_lock:
+            if self._hard_restart_requested:
+                return
+            self._hard_restart_requested = True
+
+        logger.critical(f"Forcing clean daemon restart: {reason}")
+        if power_off:
+            try:
+                chip().power_off()
+            except Exception as e:
+                logger.warning(
+                    f"Bluetooth controller power-off before restart failed: "
+                    f"{errstr(e)}"
+                )
+
+        # Do not run normal async shutdown here: this path exists precisely
+        # because an old task or transport cannot be trusted to finish it.
+        os._exit(1)
 
     async def _do_connect(self, address, protocol):
         async with self._op_lock:
