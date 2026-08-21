@@ -506,3 +506,107 @@ class BLEMixin:
         if report_id:
             data = bytes([report_id]) + data
         self._forward_report(data)
+
+    async def _pair_ble(self, address: str) -> bool:
+        """Pair with a BLE device."""
+        log.info(f"[BLE] Pairing with {address}...")
+
+        target = Address(address)
+        try:
+            self.connection = await self.device.connect(
+                target,
+                own_address_type=OwnAddressType.PUBLIC,
+                timeout=config.connect_timeout,
+            )
+        except Exception as e:
+            log.error(f"[BLE] Connection failed: {e}")
+            return False
+
+        self.peer = Peer(self.connection)
+        self.current_device_address = address
+        self.connected_protocol = Protocol.BLE
+        log.success(f"[BLE] Connected to {address}")
+
+        try:
+            log.info("[BLE] Initiating pairing...")
+            await self.connection.pair()
+            log.success("[BLE] Pairing complete!")
+
+            if not self.connection.is_encrypted:
+                raise InvalidStateError("[BLE] Link not encrypted after pairing")
+
+            await self._discover_ble_hid_service()
+
+            return True
+        except Exception as e:
+            log.error(f"[BLE] Pairing failed: {e}")
+            if self.connection:
+                try:
+                    await self.connection.disconnect()
+                except Exception:
+                    pass
+                self.connection = None
+                self.peer = None
+            return False
+
+    async def _discover_ble_hid_service(self, process_reports: bool = False):
+        """Discover BLE GATT HID service and cache its report descriptor."""
+        await self.peer.discover_services()
+
+        if not self.device_name:
+            await self._read_ble_device_name()
+
+        hid_services = [
+            service for service in self.peer.services
+            if service.uuid == GATT_HUMAN_INTERFACE_DEVICE_SERVICE
+        ]
+        if not hid_services:
+            if process_reports:
+                raise InvalidStateError("[BLE] HID service not found")
+            log.warning("[BLE] HID service not found")
+            return
+
+        hid_service = hid_services[0]
+        log.success("[BLE] Found HID service")
+
+        await self.peer.discover_characteristics(service=hid_service)
+
+        for char in hid_service.characteristics:
+            if char.uuid == GATT_REPORT_MAP_CHARACTERISTIC and not self.report_map:
+                try:
+                    value = await self.peer.read_value(char)
+                    self.report_map = bytes(value)
+                    log.success(
+                        f"[BLE] Got descriptor: {len(self.report_map)} bytes"
+                    )
+
+                    self.device_cache.save(self.current_device_address, {
+                        'report_map': self.report_map.hex(),
+                        'device_name': self.device_name,
+                    })
+                except Exception as e:
+                    log.warning(f"[BLE] Failed to read report map: {e}")
+
+            elif process_reports and char.uuid == GATT_REPORT_CHARACTERISTIC:
+                await self._process_ble_report_char(char)
+
+    async def _continue_ble_after_pairing(self):
+        """Continue BLE connection after pairing."""
+        if not self.connection:
+            log.info(f"[BLE] Reconnecting to {self.current_device_address}...")
+            target = Address(self.current_device_address)
+            self.connection = await self.device.connect(
+                target,
+                own_address_type=OwnAddressType.PUBLIC,
+                timeout=config.connect_timeout,
+            )
+            self.peer = Peer(self.connection)
+            self.connection.on('disconnection', self._on_disconnection)
+            await self._ble_restore_or_pair()
+        else:
+            log.info("[BLE] Using existing connection from pairing")
+            if not self.peer:
+                self.peer = Peer(self.connection)
+            await self._ble_restore_or_pair()
+
+        await self._setup_ble_hid()
