@@ -96,6 +96,22 @@ end
 HIDPassthrough.START_TIMEOUT = 15
 HIDPassthrough.STOP_TIMEOUT = 5
 HIDPassthrough.AUTO_RECONNECT_DELAY = 3
+HIDPassthrough.AUTO_RECONNECT_SPAWN_DELAY = 6
+HIDPassthrough.DAEMON_ENABLED_SETTING = "hidpassthrough_daemon_enabled"
+HIDPassthrough.INPUT_RECOVERY_DELAYS = { 1, 3, 7 }
+
+-- Persist the user's intent separately from the live process state. The first
+-- run defaults to enabled, while an explicit stop remains respected on later
+-- KOReader starts.
+function HIDPassthrough:_daemonWanted()
+    local wanted = G_reader_settings:readSetting(self.DAEMON_ENABLED_SETTING)
+    if wanted == nil then return true end
+    return wanted == true
+end
+
+function HIDPassthrough:_rememberDaemonWanted(wanted)
+    G_reader_settings:saveSetting(self.DAEMON_ENABLED_SETTING, wanted == true)
+end
 
 -- Returns state, body where state is "off" / "api_only" / "on".
 function HIDPassthrough:getState()
@@ -117,14 +133,46 @@ end
 -- Ask the existing recovery endpoint once after a KOReader lifecycle event,
 -- but only when the daemon is enabled and the HID link is actually absent.
 -- This is intentionally not a timer loop or BLE keepalive.
-function HIDPassthrough:_autoReconnectIfNeeded(reason)
+function HIDPassthrough:_autoReconnectIfNeeded(reason, after_spawn)
+    if not self:_daemonWanted() then
+        logger.dbg("HIDPassthrough: auto reconnect skipped; disabled by user")
+        return
+    end
+
     local status, err = self:_httpGetJson("/status")
     if not status then
-        logger.dbg("HIDPassthrough: auto reconnect status unavailable:", err)
+        if after_spawn then
+            logger.warn("HIDPassthrough: daemon API still unavailable after startup:", err)
+            return
+        end
+
+        -- KOReader may have restarted after the daemon process was stopped.
+        -- Spawn it without blocking the UI, then perform one delayed health
+        -- check. This is bounded and is not a reconnect/keepalive loop.
+        local ok, spawn_err = self:_spawnBinary()
+        if not ok then
+            logger.warn("HIDPassthrough: automatic daemon start failed:", spawn_err)
+            return
+        end
+        logger.info("HIDPassthrough: started daemon after", reason)
+        self:_scheduleAutoReconnect(
+            reason .. " daemon startup",
+            self.AUTO_RECONNECT_SPAWN_DELAY,
+            true
+        )
         return
     end
     if status.daemon_running ~= true then
-        logger.dbg("HIDPassthrough: auto reconnect skipped; daemon is off")
+        logger.info("HIDPassthrough: resuming enabled daemon after", reason)
+        local result, request_err = self:_httpGetJson("/start")
+        if not result or result.ok ~= true then
+            logger.warn(
+                "HIDPassthrough: automatic daemon resume failed:",
+                request_err or (result and result.error) or "unknown error"
+            )
+            return
+        end
+        self:_scheduleInputRecovery(reason)
         return
     end
     if (status.device_count or 0) < 1 then
@@ -133,6 +181,7 @@ function HIDPassthrough:_autoReconnectIfNeeded(reason)
     end
     if status.connected_device and status.hid_ready == true then
         logger.dbg("HIDPassthrough: auto reconnect skipped; HID is healthy")
+        self:_scheduleInputRecovery(reason)
         return
     end
 
@@ -143,7 +192,9 @@ function HIDPassthrough:_autoReconnectIfNeeded(reason)
             "HIDPassthrough: auto reconnect request failed:",
             request_err or (result and result.error) or "unknown error"
         )
+        return
     end
+    self:_scheduleInputRecovery(reason)
 end
 
 function HIDPassthrough:_cancelAutoReconnect()
@@ -153,13 +204,36 @@ function HIDPassthrough:_cancelAutoReconnect()
     end
 end
 
-function HIDPassthrough:_scheduleAutoReconnect(reason)
+function HIDPassthrough:_scheduleAutoReconnect(reason, delay, after_spawn)
     self:_cancelAutoReconnect()
     self._auto_reconnect_cb = function()
         self._auto_reconnect_cb = nil
-        self:_autoReconnectIfNeeded(reason)
+        self:_autoReconnectIfNeeded(reason, after_spawn)
     end
-    UIManager:scheduleIn(self.AUTO_RECONNECT_DELAY, self._auto_reconnect_cb)
+    UIManager:scheduleIn(delay or self.AUTO_RECONNECT_DELAY, self._auto_reconnect_cb)
+end
+
+function HIDPassthrough:_cancelInputRecovery()
+    for _, callback in ipairs(self._input_recovery_cbs or {}) do
+        UIManager:unschedule(callback)
+    end
+    self._input_recovery_cbs = nil
+end
+
+-- UHID recreates /dev/input/eventX after a reconnect. Kindle hotplug events
+-- can race KOReader startup, so perform a small, finite set of local rescans.
+-- This neither polls Bluetooth nor sends traffic to the page turner.
+function HIDPassthrough:_scheduleInputRecovery(reason)
+    self:_cancelInputRecovery()
+    self._input_recovery_cbs = {}
+    for _, delay in ipairs(self.INPUT_RECOVERY_DELAYS) do
+        local callback = function()
+            logger.dbg("HIDPassthrough: rescanning input nodes after", reason)
+            self:_scanInputs(true)
+        end
+        table.insert(self._input_recovery_cbs, callback)
+        UIManager:scheduleIn(delay, callback)
+    end
 end
 
 function HIDPassthrough:onResume()
@@ -296,10 +370,10 @@ function HIDPassthrough:_detachInput(path)
     logger.info("HIDPassthrough: detached input", path)
 end
 
-function HIDPassthrough:_scanInputs()
+function HIDPassthrough:_scanInputs(force)
     for name in lfs.dir("/dev/input") do
         if name:match("^event%d+$") then
-            self:_attachInput("/dev/input/" .. name)
+            self:_attachInput("/dev/input/" .. name, force)
         end
     end
 end
@@ -957,6 +1031,13 @@ function HIDPassthrough:start()
         tostring(self.START_TIMEOUT))
 end
 
+function HIDPassthrough:startRemembered()
+    self:_rememberDaemonWanted(true)
+    local ok, msg = self:start()
+    if ok then self:_scheduleInputRecovery("manual daemon start") end
+    return ok, msg
+end
+
 function HIDPassthrough:stop()
     local state = self:getState()
 
@@ -984,11 +1065,25 @@ function HIDPassthrough:stop()
     return false, _("Daemon did not stop within timeout.")
 end
 
+function HIDPassthrough:stopRemembered()
+    self:_rememberDaemonWanted(false)
+    self:_cancelInputRecovery()
+    return self:stop()
+end
+
 function HIDPassthrough:toggle()
     if self:isRunning() then
         return self:stop()
     else
         return self:start()
+    end
+end
+
+function HIDPassthrough:toggleRemembered()
+    if self:isRunning() then
+        return self:stopRemembered()
+    else
+        return self:startRemembered()
     end
 end
 
@@ -1106,6 +1201,30 @@ local function infoToast(text, is_error)
         text = text,
         timeout = is_error and 4 or 2,
     })
+end
+
+-- Keep the proven manual recovery path available even with automatic
+-- lifecycle recovery enabled. /start deliberately recycles a stale session.
+function HIDPassthrough:reconnectPairedDevices()
+    if not self:isRunning() then
+        infoToast(_("请先启动 HID Passthrough daemon。"), true)
+        return
+    end
+
+    infoToast(_("正在重新连接翻页器…"))
+    UIManager:nextTick(function()
+        local data, err = self:_httpGetJson("/start")
+        if not data then
+            infoToast(T(_("重新连接翻页器失败：%1"), tostring(err)), true)
+            return
+        end
+        if data.ok then
+            infoToast(_("已请求重新连接翻页器"))
+            self:_scheduleInputRecovery("manual page-turner reconnect")
+        else
+            infoToast(T(_("重新连接翻页器失败：%1"), data.error or _("未知错误")), true)
+        end
+    end)
 end
 
 local function deviceLabel(dev)
@@ -1657,12 +1776,12 @@ end
 
 -- true, or UIManager hands these to us again as an active widget.
 function HIDPassthrough:onHIDPassthroughStart()
-    self:_runActionAsync(_("Starting HID Passthrough daemon…"), self.start)
+    self:_runActionAsync(_("Starting HID Passthrough daemon…"), self.startRemembered)
     return true
 end
 
 function HIDPassthrough:onHIDPassthroughStop()
-    self:_runActionAsync(_("Stopping HID Passthrough daemon…"), self.stop)
+    self:_runActionAsync(_("Stopping HID Passthrough daemon…"), self.stopRemembered)
     return true
 end
 
@@ -1670,7 +1789,7 @@ function HIDPassthrough:onHIDPassthroughToggle()
     local label = self:isRunning()
         and _("Stopping HID Passthrough daemon…")
         or  _("Starting HID Passthrough daemon…")
-    self:_runActionAsync(label, self.toggle)
+    self:_runActionAsync(label, self.toggleRemembered)
     return true
 end
 
@@ -1708,10 +1827,11 @@ end
 function HIDPassthrough:onCloseWidget()
     self:_cancelPolls()
     self:_cancelAutoReconnect()
+    self:_cancelInputRecovery()
 end
 
 function HIDPassthrough:_doToggle(touchmenu_instance)
-    local ok, msg = self:toggle()
+    local ok, msg = self:toggleRemembered()
     UIManager:show(InfoMessage:new{
         text = msg,
         timeout = ok and 2 or 4,
@@ -1748,6 +1868,12 @@ function HIDPassthrough:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 callback = function() self:scanForDevices() end,
                 separator = true,
+            },
+            {
+                text = _("重新连接已配对设备"),
+                enabled_func = function() return self:isRunning() end,
+                keep_menu_open = true,
+                callback = function() self:reconnectPairedDevices() end,
             },
             {
                 text = _("Paired devices"),
