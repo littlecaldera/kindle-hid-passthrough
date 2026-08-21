@@ -31,6 +31,10 @@ MANUAL_RECONNECT_SUSPEND_TIMEOUT = 10.0
 # task graph and a freshly closed UART fd table.
 MANUAL_RECONNECT_WATCHDOG_TIMEOUT = 15.0
 
+# Give the ordinary post-wake reconnect loop a short chance to restore HID.
+# This is a one-shot health check, not a periodic keepalive.
+AUTO_RECONNECT_AFTER_RESUME_DELAY = 8.0
+
 __all__ = ['DaemonController']
 
 
@@ -50,6 +54,7 @@ class DaemonController:
         self._chip_powered_off_for_suspend = False
         self._manual_reconnect_future = None
         self._manual_reconnect_watchdog = None
+        self._auto_reconnect_task = None
         self._hard_restart_lock = threading.Lock()
         self._hard_restart_requested = False
 
@@ -344,6 +349,7 @@ class DaemonController:
 
     async def _do_system_suspend(self, event):
         async with self._op_lock:
+            self._cancel_auto_reconnect_after_resume()
             if event == 'goingToScreenSaver':
                 if self.daemon._suspended:
                     return
@@ -384,6 +390,53 @@ class DaemonController:
                 return
             logger.info(f"System resume ({event}): restarting BT")
             await self.daemon.resume()
+            self._schedule_auto_reconnect_after_resume(event)
+
+    def _cancel_auto_reconnect_after_resume(self):
+        """Cancel a stale one-shot wake check when another suspend begins."""
+        task = self._auto_reconnect_task
+        if task and not task.done():
+            task.cancel()
+        self._auto_reconnect_task = None
+
+    def _schedule_auto_reconnect_after_resume(self, event):
+        """Schedule one health check after the normal resume path."""
+        self._cancel_auto_reconnect_after_resume()
+        task = asyncio.create_task(self._auto_reconnect_after_resume(event))
+        self._auto_reconnect_task = task
+
+        def clear_finished(finished):
+            if self._auto_reconnect_task is finished:
+                self._auto_reconnect_task = None
+
+        task.add_done_callback(clear_finished)
+
+    async def _auto_reconnect_after_resume(self, event):
+        """Use the existing reliable reconnect only when wake did not recover."""
+        try:
+            await asyncio.sleep(AUTO_RECONNECT_AFTER_RESUME_DELAY)
+        except asyncio.CancelledError:
+            return
+
+        if self._suspended_by_system or self.daemon._suspended:
+            logger.info("Auto reconnect skipped: system is suspended again")
+            return
+        if not self.daemon.running:
+            logger.info("Auto reconnect skipped: daemon is disabled")
+            return
+        if not self._get_devices_cached():
+            logger.info("Auto reconnect skipped: no paired devices")
+            return
+
+        state = self.daemon.connection_state
+        if state.get("connected") and state.get("hid_ready"):
+            logger.info("Auto reconnect skipped: HID link is already healthy")
+            return
+
+        logger.info(
+            f"Auto reconnect after {event}: HID link was not restored"
+        )
+        self.request_connect()
 
     # ---- Remove ----
 

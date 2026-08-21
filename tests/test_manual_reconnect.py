@@ -36,9 +36,12 @@ class FakeDaemon:
         self.suspend_error = suspend_error
         self.suspend_hangs = suspend_hangs
         self.host = host
+        self.running = True
+        self._suspended = False
 
     async def suspend(self):
         self.events.append("suspend")
+        self._suspended = True
         if self.suspend_hangs:
             await asyncio.Event().wait()
         if self.suspend_error:
@@ -46,9 +49,16 @@ class FakeDaemon:
 
     async def resume(self):
         self.events.append("resume")
+        self._suspended = False
 
     async def disconnect(self):
         self.events.append("disconnect")
+
+    @property
+    def connection_state(self):
+        if self.host and self.host._is_connection_alive():
+            return {"connected": True, "hid_ready": True}
+        return {"connected": False}
 
 
 class FakeChip:
@@ -67,6 +77,7 @@ def make_controller(daemon):
     subject._chip_powered_off_for_suspend = True
     subject._manual_reconnect_future = None
     subject._manual_reconnect_watchdog = None
+    subject._auto_reconnect_task = None
     subject._hard_restart_lock = threading.Lock()
     subject._hard_restart_requested = False
     return subject
@@ -189,3 +200,70 @@ def test_hard_restart_is_idempotent():
         subject._hard_restart("second", power_off=False)
 
     exit_process.assert_called_once_with(1)
+
+
+def test_system_resume_adds_one_shot_auto_reconnect_for_missing_link():
+    events = []
+    subject = make_controller(FakeDaemon(events))
+    subject._suspended_by_system = True
+    subject.daemon._suspended = True
+    subject._get_devices_cached = lambda: [{"address": "AA:BB"}]
+
+    async def run_test():
+        with patch.object(
+            controller, "AUTO_RECONNECT_AFTER_RESUME_DELAY", 0
+        ), patch.object(subject, "request_connect") as reconnect:
+            await subject._do_system_resume("wakeupFromSuspend")
+            await subject._auto_reconnect_task
+            reconnect.assert_called_once_with()
+
+    asyncio.run(run_test())
+    assert events == ["resume"]
+
+
+def test_system_resume_auto_reconnect_preserves_healthy_link():
+    events = []
+    subject = make_controller(FakeDaemon(events, host=FakeHost(alive=True)))
+    subject._suspended_by_system = True
+    subject.daemon._suspended = True
+    subject._get_devices_cached = lambda: [{"address": "AA:BB"}]
+
+    async def run_test():
+        with patch.object(
+            controller, "AUTO_RECONNECT_AFTER_RESUME_DELAY", 0
+        ), patch.object(subject, "request_connect") as reconnect:
+            await subject._do_system_resume("wakeupFromSuspend")
+            await subject._auto_reconnect_task
+            reconnect.assert_not_called()
+
+    asyncio.run(run_test())
+    assert events == ["resume"]
+
+
+def test_auto_reconnect_respects_disabled_daemon():
+    subject = make_controller(FakeDaemon([]))
+    subject.daemon.running = False
+    subject._get_devices_cached = lambda: [{"address": "AA:BB"}]
+
+    async def run_test():
+        with patch.object(
+            controller, "AUTO_RECONNECT_AFTER_RESUME_DELAY", 0
+        ), patch.object(subject, "request_connect") as reconnect:
+            await subject._auto_reconnect_after_resume("wakeupFromSuspend")
+            reconnect.assert_not_called()
+
+    asyncio.run(run_test())
+
+
+def test_auto_reconnect_requires_a_paired_device():
+    subject = make_controller(FakeDaemon([]))
+    subject._get_devices_cached = lambda: []
+
+    async def run_test():
+        with patch.object(
+            controller, "AUTO_RECONNECT_AFTER_RESUME_DELAY", 0
+        ), patch.object(subject, "request_connect") as reconnect:
+            await subject._auto_reconnect_after_resume("wakeupFromSuspend")
+            reconnect.assert_not_called()
+
+    asyncio.run(run_test())

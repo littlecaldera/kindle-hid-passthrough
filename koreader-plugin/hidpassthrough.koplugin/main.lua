@@ -95,6 +95,7 @@ end
 
 HIDPassthrough.START_TIMEOUT = 15
 HIDPassthrough.STOP_TIMEOUT = 5
+HIDPassthrough.AUTO_RECONNECT_DELAY = 3
 
 -- Returns state, body where state is "off" / "api_only" / "on".
 function HIDPassthrough:getState()
@@ -111,6 +112,58 @@ end
 
 function HIDPassthrough:isRunning()
     return self:getState() == "on"
+end
+
+-- Ask the existing recovery endpoint once after a KOReader lifecycle event,
+-- but only when the daemon is enabled and the HID link is actually absent.
+-- This is intentionally not a timer loop or BLE keepalive.
+function HIDPassthrough:_autoReconnectIfNeeded(reason)
+    local status, err = self:_httpGetJson("/status")
+    if not status then
+        logger.dbg("HIDPassthrough: auto reconnect status unavailable:", err)
+        return
+    end
+    if status.daemon_running ~= true then
+        logger.dbg("HIDPassthrough: auto reconnect skipped; daemon is off")
+        return
+    end
+    if (status.device_count or 0) < 1 then
+        logger.dbg("HIDPassthrough: auto reconnect skipped; no paired devices")
+        return
+    end
+    if status.connected_device and status.hid_ready == true then
+        logger.dbg("HIDPassthrough: auto reconnect skipped; HID is healthy")
+        return
+    end
+
+    logger.info("HIDPassthrough: requesting auto reconnect after", reason)
+    local result, request_err = self:_httpGetJson("/start")
+    if not result or result.ok ~= true then
+        logger.warn(
+            "HIDPassthrough: auto reconnect request failed:",
+            request_err or (result and result.error) or "unknown error"
+        )
+    end
+end
+
+function HIDPassthrough:_cancelAutoReconnect()
+    if self._auto_reconnect_cb then
+        UIManager:unschedule(self._auto_reconnect_cb)
+        self._auto_reconnect_cb = nil
+    end
+end
+
+function HIDPassthrough:_scheduleAutoReconnect(reason)
+    self:_cancelAutoReconnect()
+    self._auto_reconnect_cb = function()
+        self._auto_reconnect_cb = nil
+        self:_autoReconnectIfNeeded(reason)
+    end
+    UIManager:scheduleIn(self.AUTO_RECONNECT_DELAY, self._auto_reconnect_cb)
+end
+
+function HIDPassthrough:onResume()
+    self:_scheduleAutoReconnect("resume")
 end
 
 ------------------------------------------------------------------------------
@@ -1649,10 +1702,12 @@ function HIDPassthrough:init()
     UIManager.event_hook:registerWidget("InputEvent", self)
     -- A device may already be connected.
     self:_scanInputs()
+    self:_scheduleAutoReconnect("KOReader startup")
 end
 
 function HIDPassthrough:onCloseWidget()
     self:_cancelPolls()
+    self:_cancelAutoReconnect()
 end
 
 function HIDPassthrough:_doToggle(touchmenu_instance)
